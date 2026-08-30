@@ -1,57 +1,151 @@
 "use client";
 
 import { Canvas } from "@react-three/fiber";
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 
 export type SceneObject = { id: number; class: string; lateral: number; distance: number };
 export type SceneLane = { centerOffset: number; confidence: number; visible: boolean; curve: number };
 type Props = { objects: SceneObject[]; lane: SceneLane };
 
-function Vehicle({ x, z, kind }: { x: number; z: number; kind: string }) {
-  const truck = kind === "truck" || kind === "bus";
-  const motorcycle = kind === "motorcycle" || kind === "bicycle";
-  const size: [number, number, number] = truck ? [1.95, 1.75, 4.8] : motorcycle ? [0.7, 1.05, 2] : [1.7, 1.1, 3.7];
-  return <group position={[x, size[1] / 2 + .04, -z]}>
-    <mesh castShadow><boxGeometry args={size}/><meshStandardMaterial color={truck ? "#d5d9df" : "#eceef1"} roughness={.38} metalness={.16}/></mesh>
-    {!motorcycle && <mesh position={[0,size[1]*.36,-.28]}><boxGeometry args={[size[0]*.76,size[1]*.46,size[2]*.48]}/><meshStandardMaterial color="#aeb7c4" roughness={.28} metalness={.1}/></mesh>}
-  </group>;
-}
+type InstanceSpec = { x: number; y: number; z: number; sx?: number; sy?: number; sz?: number; ry?: number };
 
-function Pedestrian({ x, z }: { x:number; z:number }) {
-  return <group position={[x,0,-z]}><mesh position={[0,.9,0]}><capsuleGeometry args={[.18,.75,5,10]}/><meshStandardMaterial color="#e3e5e8"/></mesh><mesh position={[0,1.55,0]}><sphereGeometry args={[.22,12,12]}/><meshStandardMaterial color="#f3f4f5"/></mesh></group>;
-}
+const tempObject = new THREE.Object3D();
 
-function TrafficSignal({ x, z }: { x:number; z:number }) {
-  return <group position={[x,0,-z]}><mesh position={[0,2.3,0]}><cylinderGeometry args={[.045,.045,4.6,8]}/><meshStandardMaterial color="#c5c9d0"/></mesh><mesh position={[0,4.42,0]}><boxGeometry args={[.48,.95,.28]}/><meshStandardMaterial color="#323845"/></mesh><mesh position={[0,4.67,.16]}><sphereGeometry args={[.105,10,10]}/><meshBasicMaterial color="#ff5a64"/></mesh><mesh position={[0,4.42,.16]}><sphereGeometry args={[.105,10,10]}/><meshBasicMaterial color="#ffcf5a"/></mesh><mesh position={[0,4.17,.16]}><sphereGeometry args={[.105,10,10]}/><meshBasicMaterial color="#55e69c"/></mesh></group>;
+function Instances({ items, geometry, material }: { items: InstanceSpec[]; geometry: THREE.BufferGeometry; material: THREE.Material }) {
+  const ref = useRef<THREE.InstancedMesh>(null);
+
+  useLayoutEffect(() => {
+    const mesh = ref.current;
+    if (!mesh) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      tempObject.position.set(item.x, item.y, item.z);
+      tempObject.rotation.set(0, item.ry ?? 0, 0);
+      tempObject.scale.set(item.sx ?? 1, item.sy ?? 1, item.sz ?? 1);
+      tempObject.updateMatrix();
+      mesh.setMatrixAt(i, tempObject.matrix);
+    }
+    mesh.count = items.length;
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [items]);
+
+  if (!items.length) return null;
+  return <instancedMesh ref={ref} args={[geometry, material, items.length]} frustumCulled={false} />;
 }
 
 function RoadScene({ objects, lane }: Props) {
-  const laneShift = THREE.MathUtils.clamp(lane.centerOffset * 2.8, -1.25, 1.25);
-  const curve = THREE.MathUtils.clamp(lane.curve, -1, 1) * 7;
-  const laneHalfWidth = 1.8;
-  const dashes = useMemo(()=>Array.from({length:15},(_,i)=>5+i*5.5),[]);
-  const pathPieces = useMemo(()=>Array.from({length:19},(_,i)=>3+i*3.4),[]);
-  const roadX=(z:number)=>laneShift + curve*Math.pow(z/88,2);
-  const heading=(z:number)=>Math.atan((2*curve*z)/(88*88));
+  const laneShift = THREE.MathUtils.clamp(lane.centerOffset * 2.6, -1.2, 1.2);
+  const curve = THREE.MathUtils.clamp(lane.curve, -1, 1) * 6.4;
+  const roadX = (z: number) => laneShift + curve * (z / 86) * (z / 86);
+  const heading = (z: number) => Math.atan((2 * curve * z) / (86 * 86));
+
+  const resources = useMemo(() => ({
+    roadGeometry: new THREE.PlaneGeometry(26, 110),
+    laneGeometry: new THREE.PlaneGeometry(0.11, 3.3),
+    pathGeometry: new THREE.PlaneGeometry(3.1, 4.5),
+    carGeometry: new THREE.BoxGeometry(1.65, 1, 3.6),
+    roofGeometry: new THREE.BoxGeometry(1.25, 0.42, 1.75),
+    personGeometry: new THREE.CapsuleGeometry(0.16, 0.62, 2, 5),
+    headGeometry: new THREE.SphereGeometry(0.2, 6, 5),
+    poleGeometry: new THREE.CylinderGeometry(0.04, 0.04, 4.2, 5),
+    signalGeometry: new THREE.BoxGeometry(0.42, 0.82, 0.22),
+    roadMaterial: new THREE.MeshBasicMaterial({ color: "#2f3541" }),
+    laneMaterial: new THREE.MeshBasicMaterial({ color: "#f5f7fb" }),
+    pathMaterial: new THREE.MeshBasicMaterial({ color: "#2d78ff", transparent: true, opacity: 0.18, depthWrite: false }),
+    vehicleMaterial: new THREE.MeshBasicMaterial({ color: "#dfe5ec" }),
+    roofMaterial: new THREE.MeshBasicMaterial({ color: "#8193a8" }),
+    personMaterial: new THREE.MeshBasicMaterial({ color: "#f0d5b8" }),
+    signalPoleMaterial: new THREE.MeshBasicMaterial({ color: "#aab2bd" }),
+    signalMaterial: new THREE.MeshBasicMaterial({ color: "#252a33" }),
+    egoMaterial: new THREE.MeshBasicMaterial({ color: "#f7f9fc" }),
+    egoGlassMaterial: new THREE.MeshBasicMaterial({ color: "#58708a" })
+  }), []);
+
+  const sceneData = useMemo(() => {
+    const laneMarks: InstanceSpec[] = [];
+    const path: InstanceSpec[] = [];
+
+    if (lane.visible) {
+      for (let i = 0; i < 13; i++) {
+        const z = 7 + i * 6.1;
+        const ry = -heading(z);
+        laneMarks.push({ x: roadX(z) - 1.8, y: 0.018, z: -z, ry });
+        laneMarks.push({ x: roadX(z) + 1.8, y: 0.018, z: -z, ry });
+      }
+      for (let i = 0; i < 12; i++) {
+        const z = 5 + i * 6.5;
+        path.push({ x: roadX(z), y: 0.012, z: -z, ry: -heading(z) });
+      }
+    }
+
+    const vehicleBodies: InstanceSpec[] = [];
+    const vehicleRoofs: InstanceSpec[] = [];
+    const peopleBodies: InstanceSpec[] = [];
+    const peopleHeads: InstanceSpec[] = [];
+    const signalPoles: InstanceSpec[] = [];
+    const signalBoxes: InstanceSpec[] = [];
+
+    for (const object of objects.slice(0, 14)) {
+      const z = THREE.MathUtils.clamp(object.distance * 2.15 + 4, 7, 82);
+      const x = roadX(z) + THREE.MathUtils.clamp(object.lateral * 7.5, -12, 12);
+      if (object.class === "person") {
+        peopleBodies.push({ x, y: 0.82, z: -z });
+        peopleHeads.push({ x, y: 1.5, z: -z });
+      } else if (object.class === "traffic light" || object.class === "stop sign") {
+        signalPoles.push({ x, y: 2.1, z: -z });
+        signalBoxes.push({ x, y: 4.05, z: -z });
+      } else {
+        const truck = object.class === "truck" || object.class === "bus";
+        const bike = object.class === "motorcycle" || object.class === "bicycle";
+        const sx = truck ? 1.16 : bike ? 0.48 : 1;
+        const sy = truck ? 1.5 : bike ? 0.8 : 1;
+        const sz = truck ? 1.3 : bike ? 0.58 : 1;
+        vehicleBodies.push({ x, y: 0.55 * sy, z: -z, sx, sy, sz });
+        if (!bike) vehicleRoofs.push({ x, y: 1.05 * sy, z: -z - 0.2, sx: truck ? 1.12 : 1, sy: truck ? 1.25 : 1, sz: truck ? 1.2 : 1 });
+      }
+    }
+
+    return { laneMarks, path, vehicleBodies, vehicleRoofs, peopleBodies, peopleHeads, signalPoles, signalBoxes };
+  }, [objects, lane.visible, laneShift, curve]);
 
   return <>
-    <color attach="background" args={["#77819b"]}/><fog attach="fog" args={["#77819b",34,98]}/>
-    <ambientLight intensity={2.15}/><directionalLight position={[10,20,10]} intensity={2.25} castShadow/>
+    <color attach="background" args={["#596274"]} />
+    <fog attach="fog" args={["#596274", 36, 94]} />
 
-    <mesh rotation={[-Math.PI/2,0,0]} position={[0,-.04,-48]} receiveShadow><planeGeometry args={[100,150]}/><meshStandardMaterial color="#555e72" roughness={.98}/></mesh>
+    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.04, -45]} geometry={resources.roadGeometry} material={resources.roadMaterial} />
 
-    {lane.visible && <>
-      {[-laneHalfWidth, laneHalfWidth].map(boundary=><group key={boundary}>{dashes.map(z=>{const x=roadX(z)+boundary;return <mesh key={`${boundary}-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.018,-z]}><planeGeometry args={[.13,3.25]}/><meshBasicMaterial color="#f6f7fa"/></mesh>})}</group>)}
-      {pathPieces.map(z=>{const x=roadX(z);return <mesh key={`path-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.014,-z]}><planeGeometry args={[3.15,3.65]}/><meshBasicMaterial color="#4c88ff" transparent opacity={.12 + lane.confidence*.13}/></mesh>})}
-    </>}
+    <Instances items={sceneData.laneMarks} geometry={resources.laneGeometry} material={resources.laneMaterial} />
+    <Instances items={sceneData.path} geometry={resources.pathGeometry} material={resources.pathMaterial} />
+    <Instances items={sceneData.vehicleBodies} geometry={resources.carGeometry} material={resources.vehicleMaterial} />
+    <Instances items={sceneData.vehicleRoofs} geometry={resources.roofGeometry} material={resources.roofMaterial} />
+    <Instances items={sceneData.peopleBodies} geometry={resources.personGeometry} material={resources.personMaterial} />
+    <Instances items={sceneData.peopleHeads} geometry={resources.headGeometry} material={resources.personMaterial} />
+    <Instances items={sceneData.signalPoles} geometry={resources.poleGeometry} material={resources.signalPoleMaterial} />
+    <Instances items={sceneData.signalBoxes} geometry={resources.signalGeometry} material={resources.signalMaterial} />
 
-    {!lane.visible && <mesh rotation={[-Math.PI/2,0,0]} position={[0,-.005,-42]}><planeGeometry args={[5.8,96]}/><meshStandardMaterial color="#454e61" roughness={.92}/></mesh>}
-
-    <group position={[0,.05,1.6]}><mesh position={[0,.55,0]} castShadow><boxGeometry args={[1.85,1.05,4.2]}/><meshStandardMaterial color="#f6f7f9" metalness={.2} roughness={.3}/></mesh><mesh position={[0,1.12,-.2]}><boxGeometry args={[1.5,.55,2.16]}/><meshStandardMaterial color="#8fa8c5" metalness={.16} roughness={.18}/></mesh></group>
-
-    {objects.slice(0,28).map(object=>{const z=THREE.MathUtils.clamp(object.distance*2.2+4,7,84);const x=roadX(z)+THREE.MathUtils.clamp(object.lateral*8,-14,14);if(object.class==="person")return <Pedestrian key={object.id} x={x} z={z}/>;if(object.class==="traffic light"||object.class==="stop sign")return <TrafficSignal key={object.id} x={x} z={z}/>;return <Vehicle key={object.id} x={x} z={z} kind={object.class}/>})}
+    <group position={[0, 0.05, 1.6]}>
+      <mesh position={[0, 0.52, 0]} geometry={resources.carGeometry} material={resources.egoMaterial} scale={[1.08, 1.05, 1.14]} />
+      <mesh position={[0, 1.08, -0.18]} geometry={resources.roofGeometry} material={resources.egoGlassMaterial} scale={[1.05, 1.1, 1.15]} />
+    </group>
   </>;
 }
 
-export default function AdasScene(props:Props){return <div className="adas-scene"><Canvas shadows dpr={[1,1.5]} camera={{position:[0,9.3,14.8],fov:51,near:.1,far:150}} onCreated={({camera})=>camera.lookAt(0,.15,-30)}><RoadScene {...props}/></Canvas><div className="scene-badge">3D PERCEPTION</div><div className="scene-horizon">DETECTED LANE ONLY</div></div>}
+export default function AdasScene(props: Props) {
+  return <div className="adas-scene">
+    <Canvas
+      frameloop="demand"
+      dpr={1}
+      camera={{ position: [0, 8.8, 14.4], fov: 50, near: 0.2, far: 115 }}
+      gl={{ antialias: false, alpha: false, powerPreference: "high-performance", stencil: false }}
+      onCreated={({ camera, gl }) => {
+        camera.lookAt(0, 0.15, -29);
+        gl.outputColorSpace = THREE.SRGBColorSpace;
+      }}
+    >
+      <RoadScene {...props} />
+    </Canvas>
+    <div className="scene-badge">FAST 3D PERCEPTION</div>
+    <div className="scene-horizon">GPU INSTANCED ROAD MODEL</div>
+  </div>;
+}
