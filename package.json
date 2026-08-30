@@ -6,14 +6,17 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@react-three/fiber": "^9.3.0",
     "@tensorflow-models/coco-ssd": "2.2.3",
     "@tensorflow/tfjs": "4.22.0",
+    "@types/three": "^0.179.0",
     "next": "16.3.3",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "three": "^0.179.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
