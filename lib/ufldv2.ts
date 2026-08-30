@@ -180,18 +180,35 @@ export async function createUfldv2Detector(): Promise<Ufldv2Detector> {
   const ort: OrtModule = await import("onnxruntime-web");
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
   ort.env.wasm.numThreads = 1;
+
   const ios = isIOSLike();
-  const source: string | Uint8Array = ios ? MODEL_URL : await loadModelBytes();
   const hasWebGpu = !ios && typeof navigator !== "undefined" && Boolean((navigator as Navigator & { gpu?: unknown }).gpu);
   let backend: "webgpu" | "wasm" = hasWebGpu ? "webgpu" : "wasm";
   let session: Session;
-  try {
-    session = await ort.InferenceSession.create(source, { executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"], graphOptimizationLevel: "all" });
-  } catch (error) {
-    if (!hasWebGpu) throw error;
-    console.warn("YOLOP WebGPU init failed; using WASM", error); backend = "wasm";
-    session = await ort.InferenceSession.create(source, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
+
+  if (ios) {
+    session = await ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: ["wasm"],
+      graphOptimizationLevel: "all"
+    });
+  } else {
+    const modelBytes = await loadModelBytes();
+    try {
+      session = await ort.InferenceSession.create(modelBytes, {
+        executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"],
+        graphOptimizationLevel: "all"
+      });
+    } catch (error) {
+      if (!hasWebGpu) throw error;
+      console.warn("YOLOP WebGPU init failed; using WASM", error);
+      backend = "wasm";
+      session = await ort.InferenceSession.create(modelBytes, {
+        executionProviders: ["wasm"],
+        graphOptimizationLevel: "all"
+      });
+    }
   }
+
   const preprocess = createPreprocessor();
   const laneOutputName = session.outputNames.find((name) => name.includes("lane_line")) ?? "lane_line_seg";
   return {
