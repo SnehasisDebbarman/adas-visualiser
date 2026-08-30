@@ -1,0 +1,49 @@
+name: Apply curved lane overlay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-curved-lane-overlay.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Wire curved lane results into overlay and 3D
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('app/page.tsx')
+          s = p.read_text()
+
+          old = '''function smoothSegment(a: [LanePoint,LanePoint]|null,b:[LanePoint,LanePoint]|null,alpha:number):[LanePoint,LanePoint]|null { if(!b)return a;if(!a)return b;return[lerpPoint(a[0],b[0],alpha),lerpPoint(a[1],b[1],alpha)]; }\nfunction smoothLane(a:LaneResult,b:LaneResult):LaneResult { const confidence=b.confidence>0?a.confidence+(b.confidence-a.confidence)*.28:a.confidence*.82;return{left:b.left?smoothSegment(a.left,b.left,.24):confidence>.18?a.left:null,right:b.right?smoothSegment(a.right,b.right,.24):confidence>.18?a.right:null,confidence,centerOffset:a.centerOffset+(b.centerOffset-a.centerOffset)*.2,departure:b.departure==="unknown"&&confidence>.18?a.departure:b.departure}; }'''
+          new = '''function smoothSegment(a: [LanePoint,LanePoint]|null,b:[LanePoint,LanePoint]|null,alpha:number):[LanePoint,LanePoint]|null { if(!b)return a;if(!a)return b;return[lerpPoint(a[0],b[0],alpha),lerpPoint(a[1],b[1],alpha)]; }\nfunction smoothCurve(a:LanePoint[]|undefined,b:LanePoint[]|undefined,alpha:number){if(!b?.length)return a;if(!a?.length||a.length!==b.length)return b;return b.map((p,i)=>lerpPoint(a[i],p,alpha))}\nfunction segmentFromCurve(curve?:LanePoint[]):[LanePoint,LanePoint]|null{return curve&&curve.length>1?[curve[0],curve[curve.length-1]]:null}\nfunction smoothLane(a:LaneResult,b:LaneResult):LaneResult { const confidence=b.confidence>0?a.confidence+(b.confidence-a.confidence)*.28:a.confidence*.82;const leftCurve=b.leftCurve?smoothCurve(a.leftCurve,b.leftCurve,.30):confidence>.18?a.leftCurve:undefined,rightCurve=b.rightCurve?smoothCurve(a.rightCurve,b.rightCurve,.30):confidence>.18?a.rightCurve:undefined;return{left:segmentFromCurve(leftCurve)??(b.left?smoothSegment(a.left,b.left,.24):confidence>.18?a.left:null),right:segmentFromCurve(rightCurve)??(b.right?smoothSegment(a.right,b.right,.24):confidence>.18?a.right:null),leftCurve,rightCurve,confidence,centerOffset:a.centerOffset+(b.centerOffset-a.centerOffset)*.2,departure:b.departure==="unknown"&&confidence>.18?a.departure:b.departure}; }'''
+          if old not in s: raise SystemExit('smoothLane block not found')
+          s = s.replace(old, new)
+
+          start = s.index(' const drawLaneOverlay=useCallback(')
+          end = s.index(' const drawPredictions=useCallback(', start)
+          new_overlay = ''' const drawLaneOverlay=useCallback((ctx:CanvasRenderingContext2D,lane:LaneResult)=>{if(!showLanes)return;const left=lane.leftCurve?.length?lane.leftCurve:lane.left?[...lane.left]:[],right=lane.rightCurve?.length?lane.rightCurve:lane.right?[...lane.right]:[];if(!left.length&&!right.length)return;ctx.save();ctx.lineCap="round";ctx.lineJoin="round";if(left.length>1&&right.length>1){ctx.beginPath();ctx.moveTo(left[0].x,left[0].y);for(let i=1;i<left.length;i++)ctx.lineTo(left[i].x,left[i].y);for(let i=right.length-1;i>=0;i--)ctx.lineTo(right[i].x,right[i].y);ctx.closePath();ctx.fillStyle=lane.departure==="centered"?"rgba(73,225,174,.12)":"rgba(255,190,92,.13)";ctx.fill()}const draw=(curve:LanePoint[])=>{if(curve.length<2)return;ctx.strokeStyle="#49e1ae";ctx.shadowColor="rgba(73,225,174,.62)";ctx.shadowBlur=7;ctx.lineWidth=Math.max(3,ctx.canvas.width/460);ctx.beginPath();ctx.moveTo(curve[0].x,curve[0].y);for(let i=1;i<curve.length;i++)ctx.lineTo(curve[i].x,curve[i].y);ctx.stroke()};draw(left);draw(right);ctx.restore()},[showLanes]);\n'''
+          s = s[:start] + new_overlay + s[end:]
+
+          old = ''' let laneCurve=0;if(laneResult.left&&laneResult.right){const far=(laneResult.left[0].x+laneResult.right[0].x)/2,near=(laneResult.left[1].x+laneResult.right[1].x)/2;laneCurve=((far-near)/vw)*5}else if(laneResult.left){laneCurve=((laneResult.left[0].x-laneResult.left[1].x)/vw)*3}else if(laneResult.right){laneCurve=((laneResult.right[0].x-laneResult.right[1].x)/vw)*3}\n const lanePoints=[...(laneResult.left??[]),...(laneResult.right??[])];'''
+          new = ''' let laneCurve=0;const lc=laneResult.leftCurve,rc=laneResult.rightCurve;if(lc?.length&&rc?.length){const n=Math.min(lc.length,rc.length),m=Math.floor(n/2),far=(lc[0].x+rc[0].x)/2,mid=(lc[m].x+rc[m].x)/2,near=(lc[n-1].x+rc[n-1].x)/2;laneCurve=((far-near)/vw)*4.2+((far-2*mid+near)/vw)*8}else if(laneResult.left&&laneResult.right){const far=(laneResult.left[0].x+laneResult.right[0].x)/2,near=(laneResult.left[1].x+laneResult.right[1].x)/2;laneCurve=((far-near)/vw)*5}\n const lanePoints=[...(laneResult.leftCurve??laneResult.left??[]),...(laneResult.rightCurve??laneResult.right??[])];'''
+          if old not in s: raise SystemExit('laneCurve block not found')
+          s = s.replace(old, new)
+
+          p.write_text(s)
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/page.tsx
+          git commit -m 'Render fitted curved lane boundaries'
+          git push origin HEAD:main
