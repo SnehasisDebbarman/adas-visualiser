@@ -53,27 +53,56 @@ function localExpectation(data: Float32Array, maxIndex: number, row: number, lan
   return sum > 0 ? weighted / sum + 0.5 : maxIndex + 0.5;
 }
 
-function fitSegment(points: LanePoint[], width: number, height: number): [LanePoint, LanePoint] | null {
-  if (points.length < 12) return null;
-  const sorted = [...points].sort((a, b) => a.y - b.y);
-  const trimmed = sorted.slice(Math.floor(sorted.length * 0.08), Math.ceil(sorted.length * 0.94));
-  let sy = 0, sx = 0, syy = 0, syx = 0;
-  for (const point of trimmed) {
-    sy += point.y;
-    sx += point.x;
-    syy += point.y * point.y;
-    syx += point.y * point.x;
+function solve3(m: number[][], v: number[]) {
+  const a = m.map((row, i) => [...row, v[i]]);
+  for (let i = 0; i < 3; i++) {
+    let pivot = i;
+    for (let r = i + 1; r < 3; r++) if (Math.abs(a[r][i]) > Math.abs(a[pivot][i])) pivot = r;
+    [a[i], a[pivot]] = [a[pivot], a[i]];
+    if (Math.abs(a[i][i]) < 1e-9) return null;
+    const div = a[i][i];
+    for (let c = i; c < 4; c++) a[i][c] /= div;
+    for (let r = 0; r < 3; r++) {
+      if (r === i) continue;
+      const factor = a[r][i];
+      for (let c = i; c < 4; c++) a[r][c] -= factor * a[i][c];
+    }
   }
-  const n = trimmed.length;
-  const denominator = n * syy - sy * sy;
-  if (Math.abs(denominator) < 1e-6) return null;
-  const a = (n * syx - sy * sx) / denominator;
-  const b = (sx - a * sy) / n;
-  const farY = clamp(trimmed[0].y, height * 0.38, height * 0.75);
-  const nearY = clamp(trimmed[trimmed.length - 1].y, height * 0.72, height * 0.99);
+  return [a[0][3], a[1][3], a[2][3]] as const;
+}
+
+function fitCurve(points: LanePoint[], width: number, height: number): [LanePoint, LanePoint] | null {
+  if (points.length < 14) return null;
+  const sorted = [...points].sort((a, b) => a.y - b.y);
+  const start = Math.floor(sorted.length * 0.06);
+  const end = Math.ceil(sorted.length * 0.96);
+  const trimmed = sorted.slice(start, end);
+  if (trimmed.length < 12) return null;
+
+  // Quadratic fit in normalized image coordinates: x = a*y^2 + b*y + c.
+  // Normalizing keeps the matrix stable and preserves bends that a straight fit loses.
+  let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+  let tx0 = 0, tx1 = 0, tx2 = 0;
+  for (const point of trimmed) {
+    const y = point.y / height;
+    const x = point.x / width;
+    const y2 = y * y;
+    s0 += 1; s1 += y; s2 += y2; s3 += y2 * y; s4 += y2 * y2;
+    tx0 += x; tx1 += x * y; tx2 += x * y2;
+  }
+  const coeff = solve3(
+    [[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]],
+    [tx2, tx1, tx0]
+  );
+  if (!coeff) return null;
+  const [qa, qb, qc] = coeff;
+  const xAt = (yPx: number) => clamp((qa * Math.pow(yPx / height, 2) + qb * (yPx / height) + qc) * width, 0, width);
+
+  const farY = clamp(trimmed[0].y, height * 0.42, height * 0.72);
+  const nearY = clamp(trimmed[trimmed.length - 1].y, height * 0.80, height * 0.985);
   return [
-    { x: clamp(a * farY + b, 0, width), y: farY },
-    { x: clamp(a * nearY + b, 0, width), y: nearY }
+    { x: xAt(farY), y: farY },
+    { x: xAt(nearY), y: nearY }
   ];
 }
 
@@ -97,8 +126,8 @@ function makeResult(locRowTensor: Tensor, existRowTensor: Tensor, width: number,
   const existRow = existRowTensor.data as Float32Array;
   const leftDecoded = decodeLane(locRow, existRow, 1, width, height);
   const rightDecoded = decodeLane(locRow, existRow, 2, width, height);
-  const left = fitSegment(leftDecoded.points, width, height);
-  const right = fitSegment(rightDecoded.points, width, height);
+  const left = fitCurve(leftDecoded.points, width, height);
+  const right = fitCurve(rightDecoded.points, width, height);
   const confidence = left && right
     ? (leftDecoded.confidence + rightDecoded.confidence) / 2
     : Math.max(leftDecoded.confidence, rightDecoded.confidence) * 0.55;
