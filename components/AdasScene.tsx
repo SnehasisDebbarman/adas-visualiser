@@ -1,34 +1,23 @@
 "use client";
 
 import { Canvas, useFrame } from "@react-three/fiber";
-import { useLayoutEffect, useMemo, useRef } from "react";
+import { memo, useMemo, useRef } from "react";
 import * as THREE from "three";
 
 export type SceneObject = { id: number; class: string; lateral: number; distance: number };
 export type SceneLane = { centerOffset: number; confidence: number; visible: boolean; curve: number; roadDepth?: number };
 type Props = { objects: SceneObject[]; lane: SceneLane };
-type InstanceSpec = { id?: number; x: number; y: number; z: number; sx?: number; sy?: number; sz?: number; ry?: number };
+type RoadFn = (z: number) => number;
 
-const tempObject = new THREE.Object3D();
-const tempMatrix = new THREE.Matrix4();
-const tempPosition = new THREE.Vector3();
-const tempQuaternion = new THREE.Quaternion();
-const tempScale = new THREE.Vector3();
-const targetPosition = new THREE.Vector3();
-const targetQuaternion = new THREE.Quaternion();
-const targetScale = new THREE.Vector3();
-
-function makeRoadRibbon(depth: number, laneShift: number, curve: number, halfWidth = 5.4) {
-  const segments = 28;
+function ribbonGeometry(depth: number, centerAt: RoadFn, halfWidthAt: (z: number) => number, y = 0, start = 2.8, segments = 40) {
   const positions: number[] = [];
   const indices: number[] = [];
-  const roadX = (z: number) => laneShift + curve * (z / depth) * (z / depth);
   for (let i = 0; i <= segments; i++) {
     const t = i / segments;
-    const z = 3 + t * (depth - 3);
-    const perspectiveWidth = halfWidth * (1 - t * 0.46);
-    const cx = roadX(z);
-    positions.push(cx - perspectiveWidth, 0, -z, cx + perspectiveWidth, 0, -z);
+    const z = start + (depth - start) * t;
+    const c = centerAt(z);
+    const w = halfWidthAt(z);
+    positions.push(c - w, y, -z, c + w, y, -z);
     if (i < segments) {
       const a = i * 2;
       indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
@@ -37,21 +26,18 @@ function makeRoadRibbon(depth: number, laneShift: number, curve: number, halfWid
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
-  geometry.computeVertexNormals();
   return geometry;
 }
 
-function makePathRibbon(depth: number, laneShift: number, curve: number, confidence: number) {
-  const segments = 22;
+function boundaryGeometry(depth: number, centerAt: RoadFn, offset: number, start = 4, segments = 38) {
+  const width = 0.065;
   const positions: number[] = [];
   const indices: number[] = [];
-  const roadX = (z: number) => laneShift + curve * (z / depth) * (z / depth);
   for (let i = 0; i <= segments; i++) {
     const t = i / segments;
-    const z = 4 + t * Math.max(10, depth - 9);
-    const width = 1.45 * (1 - t * 0.38) * (0.92 + confidence * 0.08);
-    const cx = roadX(z);
-    positions.push(cx - width, 0.018, -z, cx + width, 0.018, -z);
+    const z = start + (depth - start) * t;
+    const x = centerAt(z) + offset;
+    positions.push(x - width, 0.035, -z, x + width, 0.035, -z);
     if (i < segments) {
       const a = i * 2;
       indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
@@ -60,213 +46,177 @@ function makePathRibbon(depth: number, laneShift: number, curve: number, confide
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
-  geometry.computeVertexNormals();
   return geometry;
 }
 
-function StaticInstances({ items, geometry, material }: { items: InstanceSpec[]; geometry: THREE.BufferGeometry; material: THREE.Material }) {
-  const ref = useRef<THREE.InstancedMesh>(null);
-  useLayoutEffect(() => {
-    const mesh = ref.current;
-    if (!mesh) return;
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      tempObject.position.set(item.x, item.y, item.z);
-      tempObject.rotation.set(0, item.ry ?? 0, 0);
-      tempObject.scale.set(item.sx ?? 1, item.sy ?? 1, item.sz ?? 1);
-      tempObject.updateMatrix();
-      mesh.setMatrixAt(i, tempObject.matrix);
-    }
-    mesh.count = items.length;
-    mesh.instanceMatrix.needsUpdate = true;
-  }, [items]);
-  if (!items.length) return null;
-  return <instancedMesh ref={ref} args={[geometry, material, Math.max(1, items.length)]} frustumCulled={false} />;
-}
+const Vehicle = memo(function Vehicle({ object, roadX, roadDepth }: { object: SceneObject; roadX: RoadFn; roadDepth: number }) {
+  const group = useRef<THREE.Group>(null);
+  const target = useMemo(() => new THREE.Vector3(), []);
+  const current = useMemo(() => new THREE.Vector3(), []);
+  const initialized = useRef(false);
+  const truck = object.class === "truck" || object.class === "bus";
+  const bike = object.class === "motorcycle" || object.class === "bicycle";
+  const z = THREE.MathUtils.clamp(object.distance * 2.05 + 4.5, 6.5, Math.max(8, roadDepth - 2));
+  const x = roadX(z) + THREE.MathUtils.clamp(object.lateral * 6.4, -10.5, 10.5);
 
-function MovingRoadInstances({ items, geometry, material, roadDepth, speed }: { items: InstanceSpec[]; geometry: THREE.BufferGeometry; material: THREE.Material; roadDepth: number; speed: number }) {
-  const ref = useRef<THREE.InstancedMesh>(null);
-  const offsetRef = useRef(0);
   useFrame((_, delta) => {
-    const mesh = ref.current;
-    if (!mesh || !items.length) return;
-    offsetRef.current = (offsetRef.current + delta * speed) % 6.2;
-    const wrap = Math.max(9, roadDepth - 4);
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      let depth = Math.abs(item.z) - offsetRef.current;
-      while (depth < 4) depth += wrap;
-      if (depth > roadDepth) depth = 4 + ((depth - 4) % wrap);
-      tempObject.position.set(item.x, item.y, -depth);
-      tempObject.rotation.set(0, item.ry ?? 0, 0);
-      tempObject.scale.set(item.sx ?? 1, item.sy ?? 1, item.sz ?? 1);
-      tempObject.updateMatrix();
-      mesh.setMatrixAt(i, tempObject.matrix);
+    if (!group.current) return;
+    target.set(x, 0, -z);
+    if (!initialized.current) {
+      current.copy(target);
+      initialized.current = true;
     }
-    mesh.count = items.length;
-    mesh.instanceMatrix.needsUpdate = true;
+    const alpha = 1 - Math.exp(-11 * Math.min(delta, 0.05));
+    current.lerp(target, alpha);
+    group.current.position.copy(current);
   });
-  if (!items.length) return null;
-  return <instancedMesh ref={ref} args={[geometry, material, Math.max(1, items.length)]} frustumCulled={false} />;
-}
 
-function SmoothInstances({ items, geometry, material, damping = 10 }: { items: InstanceSpec[]; geometry: THREE.BufferGeometry; material: THREE.Material; damping?: number }) {
-  const ref = useRef<THREE.InstancedMesh>(null);
-  const current = useRef<THREE.Matrix4[]>([]);
-  useLayoutEffect(() => {
-    if (current.current.length > items.length) current.current.length = items.length;
-    while (current.current.length < items.length) current.current.push(new THREE.Matrix4().makeScale(0, 0, 0));
-  }, [items.length]);
+  if (bike) {
+    return (
+      <group ref={group}>
+        <mesh position={[0, 0.42, 0]} scale={[0.42, 0.8, 1.15]}>
+          <boxGeometry args={[1, 1, 1]} />
+          <meshBasicMaterial color="#bbc1c8" />
+        </mesh>
+        <mesh position={[0, 0.9, -0.1]}>
+          <capsuleGeometry args={[0.18, 0.6, 2, 5]} />
+          <meshBasicMaterial color="#7f8995" />
+        </mesh>
+      </group>
+    );
+  }
+
+  const bodyScale: [number, number, number] = truck ? [2.05, 1.45, 5.0] : [1.82, 0.72, 4.05];
+  const cabinScale: [number, number, number] = truck ? [1.82, 0.86, 2.35] : [1.45, 0.58, 2.05];
+  return (
+    <group ref={group}>
+      <mesh position={[0, bodyScale[1] * 0.5 + 0.18, 0]}>
+        <boxGeometry args={bodyScale} />
+        <meshBasicMaterial color={truck ? "#c4c9cf" : "#d7dbe0"} />
+      </mesh>
+      <mesh position={[0, truck ? 1.48 : 1.02, truck ? -0.35 : -0.15]}>
+        <boxGeometry args={cabinScale} />
+        <meshBasicMaterial color="#8996a5" />
+      </mesh>
+      <mesh position={[0, truck ? 0.45 : 0.35, bodyScale[2] * 0.505]} scale={[truck ? 1.65 : 1.45, 0.12, 0.05]}>
+        <boxGeometry args={[1, 1, 1]} />
+        <meshBasicMaterial color="#eef1f4" />
+      </mesh>
+    </group>
+  );
+});
+
+const Person = memo(function Person({ object, roadX, roadDepth }: { object: SceneObject; roadX: RoadFn; roadDepth: number }) {
+  const group = useRef<THREE.Group>(null);
+  const z = THREE.MathUtils.clamp(object.distance * 2.05 + 4.5, 6.5, Math.max(8, roadDepth - 2));
+  const x = roadX(z) + THREE.MathUtils.clamp(object.lateral * 6.4, -10.5, 10.5);
   useFrame((_, delta) => {
-    const mesh = ref.current;
-    if (!mesh) return;
-    const alpha = 1 - Math.exp(-damping * Math.min(delta, 0.05));
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const target = tempMatrix.compose(
-        targetPosition.set(item.x, item.y, item.z),
-        targetQuaternion.setFromEuler(new THREE.Euler(0, item.ry ?? 0, 0)),
-        targetScale.set(item.sx ?? 1, item.sy ?? 1, item.sz ?? 1)
-      );
-      const matrix = current.current[i];
-      if (matrix.determinant() === 0) matrix.copy(target);
-      else {
-        matrix.decompose(tempPosition, tempQuaternion, tempScale);
-        tempPosition.lerp(targetPosition, alpha);
-        tempQuaternion.slerp(targetQuaternion, alpha);
-        tempScale.lerp(targetScale, alpha);
-        matrix.compose(tempPosition, tempQuaternion, tempScale);
-      }
-      mesh.setMatrixAt(i, matrix);
-    }
-    mesh.count = items.length;
-    mesh.instanceMatrix.needsUpdate = true;
+    if (!group.current) return;
+    const a = 1 - Math.exp(-10 * Math.min(delta, 0.05));
+    group.current.position.x = THREE.MathUtils.lerp(group.current.position.x, x, a);
+    group.current.position.z = THREE.MathUtils.lerp(group.current.position.z, -z, a);
   });
-  if (!items.length) return null;
-  return <instancedMesh ref={ref} args={[geometry, material, Math.max(1, items.length)]} frustumCulled={false} />;
+  return (
+    <group ref={group} position={[x, 0, -z]}>
+      <mesh position={[0, 0.83, 0]}>
+        <capsuleGeometry args={[0.16, 0.72, 2, 6]} />
+        <meshBasicMaterial color="#8f98a3" />
+      </mesh>
+      <mesh position={[0, 1.48, 0]}>
+        <sphereGeometry args={[0.19, 7, 6]} />
+        <meshBasicMaterial color="#d4c2b1" />
+      </mesh>
+    </group>
+  );
+});
+
+function EgoVehicle() {
+  return (
+    <group position={[0, 0, 2.7]}>
+      <mesh position={[0, 0.36, 0]}>
+        <boxGeometry args={[1.9, 0.62, 4.25]} />
+        <meshBasicMaterial color="#f4f5f6" />
+      </mesh>
+      <mesh position={[0, 0.94, -0.18]}>
+        <boxGeometry args={[1.5, 0.5, 2.12]} />
+        <meshBasicMaterial color="#7e93aa" />
+      </mesh>
+      <mesh position={[0, 0.22, -2.14]} scale={[1.5, 0.12, 0.05]}>
+        <boxGeometry args={[1, 1, 1]} />
+        <meshBasicMaterial color="#ff5d67" />
+      </mesh>
+    </group>
+  );
 }
 
-function RoadScene({ objects, lane }: Props) {
-  const laneShift = THREE.MathUtils.clamp(lane.centerOffset * 2.35, -1.05, 1.05);
-  const curve = THREE.MathUtils.clamp(lane.curve, -1, 1) * 5.6;
-  const roadDepth = THREE.MathUtils.clamp(lane.roadDepth ?? 70, 34, 88);
-  const roadX = (z: number) => laneShift + curve * (z / roadDepth) * (z / roadDepth);
-  const heading = (z: number) => Math.atan((2 * curve * z) / (roadDepth * roadDepth));
+function Scene({ objects, lane }: Props) {
+  const roadDepth = THREE.MathUtils.clamp(lane.roadDepth ?? 68, 32, 88);
+  const laneShift = THREE.MathUtils.clamp(lane.centerOffset * 1.8, -0.85, 0.85);
+  const curveStrength = THREE.MathUtils.clamp(lane.curve, -1, 1) * 7.2;
+  const roadX = useMemo<RoadFn>(() => (z: number) => {
+    const t = THREE.MathUtils.clamp(z / roadDepth, 0, 1);
+    return laneShift * (0.25 + t * 0.75) + curveStrength * t * t * (0.42 + 0.58 * t);
+  }, [laneShift, curveStrength, roadDepth]);
 
-  const resources = useMemo(() => ({
-    laneGeometry: new THREE.PlaneGeometry(0.09, 2.75),
-    carGeometry: new THREE.BoxGeometry(1.7, 0.72, 3.7),
-    roofGeometry: new THREE.BoxGeometry(1.18, 0.38, 1.68),
-    wheelGeometry: new THREE.BoxGeometry(0.2, 0.26, 0.56),
-    personGeometry: new THREE.CapsuleGeometry(0.14, 0.58, 2, 5),
-    headGeometry: new THREE.SphereGeometry(0.18, 6, 5),
-    poleGeometry: new THREE.CylinderGeometry(0.035, 0.035, 4.0, 5),
-    signalGeometry: new THREE.BoxGeometry(0.36, 0.7, 0.2),
-    laneMaterial: new THREE.MeshBasicMaterial({ color: "#f7f8fb" }),
-    roadMaterial: new THREE.MeshBasicMaterial({ color: "#d7dade", side: THREE.DoubleSide }),
-    pathMaterial: new THREE.MeshBasicMaterial({ color: "#4f86ff", transparent: true, opacity: 0.26, depthWrite: false, side: THREE.DoubleSide }),
-    vehicleMaterial: new THREE.MeshBasicMaterial({ color: "#c9cdd3" }),
-    roofMaterial: new THREE.MeshBasicMaterial({ color: "#8f99a7" }),
-    wheelMaterial: new THREE.MeshBasicMaterial({ color: "#4b5058" }),
-    personMaterial: new THREE.MeshBasicMaterial({ color: "#d8b48e" }),
-    signalPoleMaterial: new THREE.MeshBasicMaterial({ color: "#9ca3ad" }),
-    signalMaterial: new THREE.MeshBasicMaterial({ color: "#555b64" }),
-    egoMaterial: new THREE.MeshBasicMaterial({ color: "#f2f3f5" }),
-    egoGlassMaterial: new THREE.MeshBasicMaterial({ color: "#7f9ab4" }),
-    groundMaterial: new THREE.MeshBasicMaterial({ color: "#eceeef" })
+  const geometries = useMemo(() => ({
+    road: ribbonGeometry(roadDepth, roadX, () => 5.2, 0, 2.8, 46),
+    shoulderLeft: ribbonGeometry(roadDepth, z => roadX(z) - 5.42, () => 0.18, 0.012, 2.8, 40),
+    shoulderRight: ribbonGeometry(roadDepth, z => roadX(z) + 5.42, () => 0.18, 0.012, 2.8, 40),
+    path: ribbonGeometry(roadDepth - 3, roadX, z => 1.42 - 0.18 * (z / roadDepth), 0.025, 3.6, 38),
+    leftLane: boundaryGeometry(roadDepth, roadX, -1.78),
+    rightLane: boundaryGeometry(roadDepth, roadX, 1.78)
+  }), [roadDepth, roadX]);
+
+  const materials = useMemo(() => ({
+    ground: new THREE.MeshBasicMaterial({ color: "#d9dde2" }),
+    road: new THREE.MeshBasicMaterial({ color: "#2e343c", side: THREE.DoubleSide }),
+    shoulder: new THREE.MeshBasicMaterial({ color: "#afb6be", side: THREE.DoubleSide }),
+    lane: new THREE.MeshBasicMaterial({ color: "#f5f7f8", side: THREE.DoubleSide }),
+    path: new THREE.MeshBasicMaterial({ color: "#3478f6", transparent: true, opacity: 0.34, depthWrite: false, side: THREE.DoubleSide })
   }), []);
 
-  const roadGeometry = useMemo(() => makeRoadRibbon(roadDepth, laneShift, curve), [roadDepth, laneShift, curve]);
-  const pathGeometry = useMemo(() => makePathRibbon(roadDepth, laneShift, curve, lane.confidence), [roadDepth, laneShift, curve, lane.confidence]);
-
-  const sceneData = useMemo(() => {
-    const laneMarks: InstanceSpec[] = [];
-    if (lane.visible) {
-      const count = Math.max(5, Math.floor((roadDepth - 5) / 6.2));
-      for (let i = 0; i < count; i++) {
-        const z = 6 + i * 6.2;
-        if (z > roadDepth) break;
-        const ry = -heading(z);
-        laneMarks.push({ x: roadX(z) - 1.78, y: 0.025, z: -z, ry });
-        laneMarks.push({ x: roadX(z) + 1.78, y: 0.025, z: -z, ry });
-      }
-    }
-
-    const vehicleBodies: InstanceSpec[] = [];
-    const vehicleRoofs: InstanceSpec[] = [];
-    const wheelBlocks: InstanceSpec[] = [];
-    const peopleBodies: InstanceSpec[] = [];
-    const peopleHeads: InstanceSpec[] = [];
-    const signalPoles: InstanceSpec[] = [];
-    const signalBoxes: InstanceSpec[] = [];
-
-    for (const object of objects.slice(0, 16)) {
-      const z = THREE.MathUtils.clamp(object.distance * 2.12 + 4, 7, roadDepth - 2.5);
-      const x = roadX(z) + THREE.MathUtils.clamp(object.lateral * 6.9, -11.5, 11.5);
-      if (object.class === "person") {
-        peopleBodies.push({ id: object.id, x, y: 0.72, z: -z });
-        peopleHeads.push({ id: object.id, x, y: 1.38, z: -z });
-      } else if (object.class === "traffic light" || object.class === "stop sign") {
-        signalPoles.push({ id: object.id, x, y: 2.0, z: -z });
-        signalBoxes.push({ id: object.id, x, y: 3.87, z: -z });
-      } else {
-        const truck = object.class === "truck" || object.class === "bus";
-        const bike = object.class === "motorcycle" || object.class === "bicycle";
-        const sx = truck ? 1.12 : bike ? 0.48 : 1;
-        const sy = truck ? 1.55 : bike ? 0.82 : 1;
-        const sz = truck ? 1.33 : bike ? 0.6 : 1;
-        vehicleBodies.push({ id: object.id, x, y: 0.42 * sy, z: -z, sx, sy, sz });
-        if (!bike) {
-          vehicleRoofs.push({ id: object.id, x, y: 0.91 * sy, z: -z - 0.12, sx: truck ? 1.12 : 1, sy: truck ? 1.35 : 1, sz: truck ? 1.2 : 1 });
-          wheelBlocks.push({ x: x - 0.73 * sx, y: 0.19, z: -z - 0.88 * sz, sx, sy, sz });
-          wheelBlocks.push({ x: x + 0.73 * sx, y: 0.19, z: -z - 0.88 * sz, sx, sy, sz });
-        }
-      }
-    }
-    return { laneMarks, vehicleBodies, vehicleRoofs, wheelBlocks, peopleBodies, peopleHeads, signalPoles, signalBoxes };
-  }, [objects, lane.visible, laneShift, curve, roadDepth]);
-
-  return <>
-    <color attach="background" args={["#e9ebee"]} />
-    <fog attach="fog" args={["#e9ebee", Math.max(24, roadDepth * 0.62), roadDepth + 9]} />
-
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.055, -34]} geometry={new THREE.PlaneGeometry(90, 100)} material={resources.groundMaterial} />
-    <mesh geometry={roadGeometry} material={resources.roadMaterial} />
-    {lane.visible && <mesh geometry={pathGeometry} material={resources.pathMaterial} />}
-
-    <MovingRoadInstances items={sceneData.laneMarks} geometry={resources.laneGeometry} material={resources.laneMaterial} roadDepth={roadDepth} speed={20} />
-    <SmoothInstances items={sceneData.vehicleBodies} geometry={resources.carGeometry} material={resources.vehicleMaterial} damping={13} />
-    <SmoothInstances items={sceneData.vehicleRoofs} geometry={resources.roofGeometry} material={resources.roofMaterial} damping={13} />
-    <SmoothInstances items={sceneData.wheelBlocks} geometry={resources.wheelGeometry} material={resources.wheelMaterial} damping={13} />
-    <SmoothInstances items={sceneData.peopleBodies} geometry={resources.personGeometry} material={resources.personMaterial} damping={11} />
-    <SmoothInstances items={sceneData.peopleHeads} geometry={resources.headGeometry} material={resources.personMaterial} damping={11} />
-    <SmoothInstances items={sceneData.signalPoles} geometry={resources.poleGeometry} material={resources.signalPoleMaterial} damping={10} />
-    <SmoothInstances items={sceneData.signalBoxes} geometry={resources.signalGeometry} material={resources.signalMaterial} damping={10} />
-
-    <group position={[0, 0.03, 1.45]}>
-      <mesh position={[0, 0.39, 0]} geometry={resources.carGeometry} material={resources.egoMaterial} scale={[1.1, 0.9, 1.12]} />
-      <mesh position={[0, 0.9, -0.18]} geometry={resources.roofGeometry} material={resources.egoGlassMaterial} scale={[1.05, 1.12, 1.16]} />
-      <mesh position={[-0.77, 0.2, 0.86]} geometry={resources.wheelGeometry} material={resources.wheelMaterial} />
-      <mesh position={[0.77, 0.2, 0.86]} geometry={resources.wheelGeometry} material={resources.wheelMaterial} />
-    </group>
-  </>;
+  return (
+    <>
+      <color attach="background" args={["#cfd4da"]} />
+      <fog attach="fog" args={["#cfd4da", Math.max(30, roadDepth * 0.72), roadDepth + 12]} />
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.06, -36]} material={materials.ground}>
+        <planeGeometry args={[90, 105]} />
+      </mesh>
+      <mesh geometry={geometries.road} material={materials.road} />
+      <mesh geometry={geometries.shoulderLeft} material={materials.shoulder} />
+      <mesh geometry={geometries.shoulderRight} material={materials.shoulder} />
+      {lane.visible && <>
+        <mesh geometry={geometries.path} material={materials.path} />
+        <mesh geometry={geometries.leftLane} material={materials.lane} />
+        <mesh geometry={geometries.rightLane} material={materials.lane} />
+      </>}
+      {objects.slice(0, 18).map(object => object.class === "person" ? (
+        <Person key={object.id} object={object} roadX={roadX} roadDepth={roadDepth} />
+      ) : object.class === "traffic light" || object.class === "stop sign" ? null : (
+        <Vehicle key={object.id} object={object} roadX={roadX} roadDepth={roadDepth} />
+      ))}
+      <EgoVehicle />
+    </>
+  );
 }
 
 export default function AdasScene(props: Props) {
-  return <div className="adas-scene">
-    <Canvas
-      frameloop="always"
-      dpr={1}
-      camera={{ position: [0, 6.4, 11.2], fov: 54, near: 0.2, far: 102 }}
-      gl={{ antialias: false, alpha: false, powerPreference: "high-performance", stencil: false }}
-      onCreated={({ camera, gl }) => {
-        camera.lookAt(0, 0.35, -25);
-        gl.outputColorSpace = THREE.SRGBColorSpace;
-      }}
-    >
-      <RoadScene {...props} />
-    </Canvas>
-    <div className="scene-badge">TESLA-STYLE 3D PERCEPTION</div>
-    <div className="scene-horizon">LIVE ROAD + TRACKED OBJECTS</div>
-  </div>;
+  return (
+    <div className="adas-scene">
+      <Canvas
+        dpr={1}
+        frameloop="always"
+        camera={{ position: [0, 7.1, 14.6], fov: 47, near: 0.2, far: 120 }}
+        gl={{ antialias: false, alpha: false, powerPreference: "high-performance", stencil: false }}
+        onCreated={({ camera, gl }) => {
+          camera.lookAt(0, 0.35, -29);
+          gl.outputColorSpace = THREE.SRGBColorSpace;
+        }}
+      >
+        <Scene {...props} />
+      </Canvas>
+      <div className="scene-badge">3D ROAD MODEL</div>
+      <div className="scene-horizon">PERSISTENT TRACKS · REAL PERSPECTIVE</div>
+    </div>
+  );
 }
