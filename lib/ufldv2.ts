@@ -6,9 +6,10 @@ type Tensor = import("onnxruntime-web").Tensor;
 
 const INPUT = 640;
 const MODEL_URL = "https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/yolop-640-640.onnx";
-const MODEL_CACHE = "adas-models-yolop-v1";
+const MODEL_CACHE = "adas-models-yolop-v2";
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
+const CURVE_POINTS = 18;
 
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function isIOSLike() { return typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent); }
@@ -31,7 +32,7 @@ function solve3(m: number[][], v: number[]) {
   return [a[0][3], a[1][3], a[2][3]] as const;
 }
 
-function fitCurve(points: LanePoint[], width: number, height: number): [LanePoint, LanePoint] | null {
+function fitCurve(points: LanePoint[], width: number, height: number) {
   if (points.length < 7) return null;
   const sorted = [...points].sort((a, b) => a.y - b.y);
   let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, tx0 = 0, tx1 = 0, tx2 = 0;
@@ -43,10 +44,14 @@ function fitCurve(points: LanePoint[], width: number, height: number): [LanePoin
   const coeff = solve3([[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]], [tx2, tx1, tx0]);
   if (!coeff) return null;
   const [a, b, c] = coeff;
-  const xAt = (yPx: number) => clamp((a * Math.pow(yPx / height, 2) + b * (yPx / height) + c) * width, 0, width);
-  const farY = clamp(sorted[0].y, height * 0.40, height * 0.70);
+  const farY = clamp(sorted[0].y, height * 0.40, height * 0.72);
   const nearY = clamp(sorted[sorted.length - 1].y, height * 0.78, height * 0.985);
-  return [{ x: xAt(farY), y: farY }, { x: xAt(nearY), y: nearY }];
+  const curve = Array.from({ length: CURVE_POINTS }, (_, i) => {
+    const y = farY + ((nearY - farY) * i) / (CURVE_POINTS - 1);
+    const yn = y / height;
+    return { x: clamp((a * yn * yn + b * yn + c) * width, 0, width), y };
+  });
+  return { curve, segment: [curve[0], curve[curve.length - 1]] as [LanePoint, LanePoint] };
 }
 
 type Preprocessed = { input: Float32Array; dx: number; dy: number; contentWidth: number; contentHeight: number };
@@ -72,9 +77,9 @@ function createPreprocessor() {
 }
 
 function clusterCenters(mask: Float32Array, y: number) {
-  const centers: number[] = []; let start = -1;
+  const centers: number[] = []; let start = -1; const plane = INPUT * INPUT;
   for (let x = 0; x < INPUT; x++) {
-    const idx = y * INPUT + x, foreground = mask[INPUT * INPUT + idx] > mask[idx];
+    const idx = y * INPUT + x, foreground = mask[plane + idx] > mask[idx];
     if (foreground && start < 0) start = x;
     if ((!foreground || x === INPUT - 1) && start >= 0) {
       const end = foreground && x === INPUT - 1 ? x : x - 1;
@@ -85,38 +90,82 @@ function clusterCenters(mask: Float32Array, y: number) {
   return centers;
 }
 
-function decodeLaneMask(tensor: Tensor, prep: Preprocessed, width: number, height: number): LaneResult {
-  const data = tensor.data as Float32Array, leftPoints: LanePoint[] = [], rightPoints: LanePoint[] = [];
-  const centreX = prep.dx + prep.contentWidth / 2;
-  const yStart = prep.dy + Math.round(prep.contentHeight * 0.42), yEnd = prep.dy + Math.round(prep.contentHeight * 0.98), samples = 24;
-  for (let i = 0; i < samples; i++) {
-    const y = Math.round(yStart + ((yEnd - yStart) * i) / (samples - 1));
-    const centers = clusterCenters(data, clamp(y, 0, INPUT - 1));
-    let left: number | null = null, right: number | null = null;
+function trackBoundary(mask: Float32Array, prep: Preprocessed, side: "left" | "right", width: number, height: number) {
+  const result: LanePoint[] = [];
+  const center = prep.dx + prep.contentWidth / 2;
+  const yBottom = prep.dy + Math.round(prep.contentHeight * 0.985);
+  const yTop = prep.dy + Math.round(prep.contentHeight * 0.40);
+  const steps = 34;
+  let previousX: number | null = null, missed = 0;
+  const initialExpected = center + (side === "left" ? -1 : 1) * prep.contentWidth * 0.20;
+
+  for (let i = 0; i < steps; i++) {
+    const y = Math.round(yBottom - ((yBottom - yTop) * i) / (steps - 1));
+    const centers = clusterCenters(mask, clamp(y, 0, INPUT - 1)).filter((x) =>
+      side === "left" ? x < center + prep.contentWidth * 0.02 : x > center - prep.contentWidth * 0.02
+    );
+    if (!centers.length) { missed++; if (missed > 5) previousX = null; continue; }
+
+    const progress = i / (steps - 1);
+    const expectedTowardHorizon = center + (side === "left" ? -1 : 1) * prep.contentWidth * (0.20 - progress * 0.13);
+    const target = previousX ?? initialExpected;
+    let best: number | null = null, bestCost = Infinity;
     for (const x of centers) {
-      if (x < centreX && x >= prep.dx && (left === null || x > left)) left = x;
-      if (x > centreX && x <= prep.dx + prep.contentWidth && (right === null || x < right)) right = x;
+      const continuity = Math.abs(x - target);
+      const geometry = Math.abs(x - expectedTowardHorizon) * 0.35;
+      const maxJump = previousX === null ? prep.contentWidth * 0.24 : prep.contentWidth * (0.085 + missed * 0.025);
+      const cost = continuity + geometry;
+      if (continuity <= maxJump && cost < bestCost) { best = x; bestCost = cost; }
     }
+    if (best === null) { missed++; continue; }
+    previousX = best; missed = 0;
+    const sourceX = ((best - prep.dx) / prep.contentWidth) * width;
     const sourceY = ((y - prep.dy) / prep.contentHeight) * height;
-    if (left !== null) leftPoints.push({ x: ((left - prep.dx) / prep.contentWidth) * width, y: sourceY });
-    if (right !== null) rightPoints.push({ x: ((right - prep.dx) / prep.contentWidth) * width, y: sourceY });
+    if (sourceX >= 0 && sourceX <= width && sourceY >= 0 && sourceY <= height) result.push({ x: sourceX, y: sourceY });
   }
-  const left = fitCurve(leftPoints, width, height), right = fitCurve(rightPoints, width, height);
-  const lc = clamp(leftPoints.length / samples, 0, 1), rc = clamp(rightPoints.length / samples, 0, 1);
-  const confidence = left && right ? (lc + rc) / 2 : Math.max(lc, rc) * 0.55;
+  return result;
+}
+
+function decodeLaneMask(tensor: Tensor, prep: Preprocessed, width: number, height: number): LaneResult {
+  const data = tensor.data as Float32Array;
+  const leftPoints = trackBoundary(data, prep, "left", width, height);
+  const rightPoints = trackBoundary(data, prep, "right", width, height);
+  let leftFit = fitCurve(leftPoints, width, height), rightFit = fitCurve(rightPoints, width, height);
+
+  if (leftFit && rightFit) {
+    const nearWidth = rightFit.segment[1].x - leftFit.segment[1].x;
+    const farWidth = rightFit.segment[0].x - leftFit.segment[0].x;
+    const plausible = nearWidth > width * 0.16 && nearWidth < width * 0.85 && farWidth > width * 0.025 && farWidth < nearWidth * 1.08;
+    if (!plausible) {
+      if (leftPoints.length >= rightPoints.length) rightFit = null;
+      else leftFit = null;
+    }
+  }
+
+  const lc = clamp(leftPoints.length / 26, 0, 1), rc = clamp(rightPoints.length / 26, 0, 1);
+  const confidence = leftFit && rightFit ? (lc + rc) / 2 : Math.max(lc, rc) * 0.45;
   let centerOffset = 0; let departure: LaneResult["departure"] = "unknown";
-  if (left && right) {
-    const laneCenter = (left[1].x + right[1].x) / 2, laneWidth = Math.max(1, right[1].x - left[1].x);
+  if (leftFit && rightFit) {
+    const laneCenter = (leftFit.segment[1].x + rightFit.segment[1].x) / 2;
+    const laneWidth = Math.max(1, rightFit.segment[1].x - leftFit.segment[1].x);
     centerOffset = clamp((width / 2 - laneCenter) / laneWidth, -1, 1);
     departure = centerOffset > 0.14 ? "right" : centerOffset < -0.14 ? "left" : "centered";
   }
-  return { left, right, confidence, centerOffset, departure };
+  return {
+    left: leftFit?.segment ?? null,
+    right: rightFit?.segment ?? null,
+    leftCurve: leftFit?.curve,
+    rightCurve: rightFit?.curve,
+    confidence,
+    centerOffset,
+    departure
+  };
 }
 
 async function loadModelBytes() {
   const request = new Request(MODEL_URL, { cache: "force-cache", mode: "cors" });
   if (typeof caches !== "undefined") {
-    const cache = await caches.open(MODEL_CACHE); const cached = await cache.match(request);
+    const cache = await caches.open(MODEL_CACHE), cached = await cache.match(request);
     if (cached) return new Uint8Array(await cached.arrayBuffer());
     const response = await fetch(request); if (!response.ok) throw new Error(`YOLOP model download failed: ${response.status}`);
     try { await cache.put(request, response.clone()); } catch (error) { console.warn("Could not persist YOLOP model cache", error); }
