@@ -12,7 +12,8 @@ const CANDIDATES = [
   "ufldv2_culane_res34_320x1600.onnx"
 ];
 const outputDir = path.join(process.cwd(), "public", "models");
-const outputPath = path.join(outputDir, "ufldv2.onnx");
+// Version the public filename so it can safely use immutable caching.
+const outputPath = path.join(outputDir, "ufldv2-culane-v1.onnx");
 
 async function exists(file) {
   try { await fs.access(file); return true; } catch { return false; }
@@ -49,14 +50,12 @@ try {
   const response = await fetch(MODEL_URL);
   if (!response.ok || !response.body) throw new Error(`Model download failed: ${response.status}`);
 
-  // Stream to disk instead of materialising the whole archive in memory. Vercel's
-  // build container previously OOM-killed the process while using arrayBuffer().
   await pipeline(Readable.fromWeb(response.body), createWriteStream(archivePath));
   console.log("Archive downloaded; extracting model…");
   await extract({ file: archivePath, cwd: tempDir });
 
   const modelPath = await findCandidate(tempDir);
-  if (!modelPath) throw new Error(`No supported CULane UFLDv2 ONNX model found in archive`);
+  if (!modelPath) throw new Error("No supported CULane UFLDv2 ONNX model found in archive");
   await fs.copyFile(modelPath, outputPath);
 
   const stat = await fs.stat(outputPath);
