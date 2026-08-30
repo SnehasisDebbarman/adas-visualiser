@@ -86,12 +86,12 @@ export default function Home() {
         if (cancelled) { await detector.dispose(); return; }
         neuralLaneRef.current = detector;
         setLaneEngineState(detector.backend === "webgpu" ? "ufldv2-webgpu" : "ufldv2-wasm");
-        setStatus((current) => current.includes("analysis:") || current.startsWith("Live") ? current : `UFLDv2 lane model ready (${detector.backend.toUpperCase()})`);
+        setStatus((current) => current.includes("analysis:") || current.startsWith("Live") ? current : `YOLOP lane model ready (${detector.backend.toUpperCase()})`);
       } catch (error) {
-        console.error("UFLDv2 load failed", error);
+        console.error("YOLOP load failed", error);
         if (!cancelled) {
           setLaneEngineState("fallback");
-          setStatus("UFLDv2 unavailable — using classical lane fallback");
+          setStatus("YOLOP unavailable — using classical lane fallback");
         }
       }
     })();
@@ -187,7 +187,7 @@ export default function Home() {
         neural.detect(video)
           .then(publishLaneResult)
           .catch((error) => {
-            console.error("UFLDv2 inference failed", error);
+            console.error("YOLOP inference failed", error);
             void neural.dispose(); neuralLaneRef.current = null; setLaneEngineState("fallback");
           })
           .finally(() => { laneInferenceBusyRef.current = false; });
