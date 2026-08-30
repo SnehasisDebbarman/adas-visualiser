@@ -10,8 +10,8 @@ type RawPrediction = { bbox: [number, number, number, number]; class: string; sc
 type SourceMode = "idle" | "camera" | "video";
 const ROAD_CLASSES = new Set(["person", "bicycle", "car", "motorcycle", "bus", "truck", "traffic light", "stop sign"]);
 const VEHICLE_CLASSES = new Set(["bicycle", "car", "motorcycle", "bus", "truck"]);
-const TRACK_GRACE_MS = 1600;
-const TRACK_PREDICT_MS = 650;
+const TRACK_GRACE_MS = 2200;
+const TRACK_PREDICT_MS = 900;
 const EMPTY_LANE: LaneResult = { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
 function colourForClass(name: string) { if (name === "person") return "#ffcc66"; if (name === "traffic light" || name === "stop sign") return "#ff6b6b"; return "#6ee7ff"; }
 function centre(bbox: [number, number, number, number]) { return [bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2] as const; }
@@ -20,6 +20,8 @@ function smoothSegment(a: [LanePoint,LanePoint]|null,b:[LanePoint,LanePoint]|nul
 function smoothLane(a:LaneResult,b:LaneResult):LaneResult { const confidence=b.confidence>0?a.confidence+(b.confidence-a.confidence)*.28:a.confidence*.82;return{left:b.left?smoothSegment(a.left,b.left,.24):confidence>.18?a.left:null,right:b.right?smoothSegment(a.right,b.right,.24):confidence>.18?a.right:null,confidence,centerOffset:a.centerOffset+(b.centerOffset-a.centerOffset)*.2,departure:b.departure==="unknown"&&confidence>.18?a.departure:b.departure}; }
 function distanceFromBox(bbox:[number,number,number,number],vh:number){return Math.max(1,Math.round(24*(1-Math.min(.96,bbox[3]/vh))))}
 function boxVisible(bbox:[number,number,number,number],vw:number,vh:number){const[x,y,w,h]=bbox,margin=Math.max(vw,vh)*.035;return x+w>-margin&&y+h>-margin&&x<vw+margin&&y<vh+margin}
+function bboxIou(a:[number,number,number,number],b:[number,number,number,number]){const ax2=a[0]+a[2],ay2=a[1]+a[3],bx2=b[0]+b[2],by2=b[1]+b[3],ix=Math.max(0,Math.min(ax2,bx2)-Math.max(a[0],b[0])),iy=Math.max(0,Math.min(ay2,by2)-Math.max(a[1],b[1])),inter=ix*iy,union=a[2]*a[3]+b[2]*b[3]-inter;return union>0?inter/union:0}
+function compatibleTrackClass(a:string,b:string){return a===b||(VEHICLE_CLASSES.has(a)&&VEHICLE_CLASSES.has(b))}
 
 export default function Home(){
  const videoRef=useRef<HTMLVideoElement>(null),canvasRef=useRef<HTMLCanvasElement>(null),modelRef=useRef<ObjectDetection|null>(null),streamRef=useRef<MediaStream|null>(null),rafRef=useRef<number|null>(null),fileUrlRef=useRef<string|null>(null),predictionsRef=useRef<Prediction[]>([]),laneResultRef=useRef<LaneResult>(EMPTY_LANE),laneDetectorRef=useRef<ReturnType<typeof createLaneDetector>|null>(null),nextTrackIdRef=useRef(1),lastInferenceRef=useRef(0),lastLaneInferenceRef=useRef(0),inferenceBusyRef=useRef(false);
@@ -34,14 +36,14 @@ export default function Home(){
   const now=performance.now(),previous=predictionsRef.current,used=new Set<number>(),matchedOld=new Set<number>(),next:Prediction[]=[];
   for(const item of raw){
    const[cx,cy]=centre(item.bbox);let best:Prediction|undefined,bd=Infinity;
-   for(const old of previous){if(old.class!==item.class||used.has(old.id))continue;const[ox,oy]=centre(old.bbox),d=Math.hypot(cx-ox,cy-oy)/Math.hypot(vw,vh);if(d<bd&&d<.16){best=old;bd=d}}
+   for(const old of previous){if(!compatibleTrackClass(old.class,item.class)||used.has(old.id))continue;const age=Math.min(now-old.lastSeen,TRACK_PREDICT_MS),predicted:[number,number,number,number]=[old.bbox[0]+old.velocity[0]*age,old.bbox[1]+old.velocity[1]*age,Math.max(3,old.bbox[2]+old.velocity[2]*age),Math.max(3,old.bbox[3]+old.velocity[3]*age)],[ox,oy]=centre(predicted),centerDistance=Math.hypot(cx-ox,cy-oy)/Math.hypot(vw,vh),overlap=bboxIou(item.bbox,predicted),cost=centerDistance*.68+(1-overlap)*.32;if((centerDistance<.22||overlap>.08)&&cost<bd){best=old;bd=cost}}
    const id=best?.id??nextTrackIdRef.current++;used.add(id);if(best)matchedOld.add(id);
    const dt=Math.max(50,Math.min(700,now-(best?.lastSeen??now)));
    const velocity:[number,number,number,number]=best?[
-    THREEClamp((item.bbox[0]-best.bbox[0])/dt,-.8,.8),
-    THREEClamp((item.bbox[1]-best.bbox[1])/dt,-.8,.8),
-    THREEClamp((item.bbox[2]-best.bbox[2])/dt,-.45,.45),
-    THREEClamp((item.bbox[3]-best.bbox[3])/dt,-.45,.45)
+    best.velocity[0]*.55+THREEClamp((item.bbox[0]-best.bbox[0])/dt,-.8,.8)*.45,
+    best.velocity[1]*.55+THREEClamp((item.bbox[1]-best.bbox[1])/dt,-.8,.8)*.45,
+    best.velocity[2]*.55+THREEClamp((item.bbox[2]-best.bbox[2])/dt,-.45,.45)*.45,
+    best.velocity[3]*.55+THREEClamp((item.bbox[3]-best.bbox[3])/dt,-.45,.45)*.45
    ]:[0,0,0,0];
    next.push({...item,id,distanceHint:distanceFromBox(item.bbox,vh),lastSeen:now,velocity});
   }
