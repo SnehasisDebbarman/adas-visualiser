@@ -1,0 +1,38 @@
+name: Update lane engine labels
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-lane-engine-labels.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  update-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace stale UFLDv2 labels
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('app/page.tsx')
+          s = p.read_text()
+          s = s.replace('UFLDv2 lane model ready', 'YOLOP lane model ready')
+          s = s.replace('UFLDv2 unavailable', 'YOLOP unavailable')
+          s = s.replace('UFLDv2 load failed', 'YOLOP load failed')
+          s = s.replace('UFLDv2 inference failed', 'YOLOP inference failed')
+          s = s.replace('UFLDV2 WEBGPU', 'YOLOP WEBGPU')
+          s = s.replace('UFLDV2 WASM', 'YOLOP WASM')
+          p.write_text(s)
+          PY
+      - name: Commit label update
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/page.tsx
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: label lane engine as YOLOP'
+          git push origin HEAD:main
