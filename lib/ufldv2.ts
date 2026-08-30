@@ -10,8 +10,9 @@ const RESIZED_HEIGHT = Math.round(INPUT_HEIGHT / 0.6);
 const NUM_GRID_ROW = 200;
 const NUM_ROW = 72;
 const NUM_LANES = 4;
-const MODEL_URL = "/models/ufldv2-culane-v1.onnx";
-const MODEL_CACHE = "adas-models-v1";
+const MODEL_FP32_URL = "/models/ufldv2-culane-v1.onnx";
+const MODEL_FP16_URL = "/models/ufldv2-culane-v1-fp16.onnx";
+const MODEL_CACHE = "adas-models-v2";
 const ROW_ANCHORS = Array.from({ length: NUM_ROW }, (_, i) => 0.42 + (i * (1 - 0.42)) / (NUM_ROW - 1));
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
@@ -76,9 +77,7 @@ function solve3(m: number[][], v: number[]) {
 function fitCurve(points: LanePoint[], width: number, height: number): [LanePoint, LanePoint] | null {
   if (points.length < 14) return null;
   const sorted = [...points].sort((a, b) => a.y - b.y);
-  const start = Math.floor(sorted.length * 0.06);
-  const end = Math.ceil(sorted.length * 0.96);
-  const trimmed = sorted.slice(start, end);
+  const trimmed = sorted.slice(Math.floor(sorted.length * 0.06), Math.ceil(sorted.length * 0.96));
   if (trimmed.length < 12) return null;
 
   let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
@@ -152,26 +151,27 @@ function createPreprocessor() {
   };
 }
 
-async function loadModelBytes() {
-  const request = new Request(MODEL_URL, { cache: "force-cache" });
+async function loadModelBytes(url: string) {
+  const request = new Request(url, { cache: "force-cache" });
   if (typeof caches !== "undefined") {
     const cache = await caches.open(MODEL_CACHE);
     const cached = await cache.match(request);
     if (cached) return new Uint8Array(await cached.arrayBuffer());
 
     const response = await fetch(request);
-    if (!response.ok) throw new Error(`UFLDv2 model download failed: ${response.status}`);
+    if (!response.ok) throw new Error(`UFLDv2 model download failed (${url}): ${response.status}`);
     try { await cache.put(request, response.clone()); } catch (error) { console.warn("Could not persist UFLDv2 model cache", error); }
     return new Uint8Array(await response.arrayBuffer());
   }
 
   const response = await fetch(request);
-  if (!response.ok) throw new Error(`UFLDv2 model download failed: ${response.status}`);
+  if (!response.ok) throw new Error(`UFLDv2 model download failed (${url}): ${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
 }
 
 export type Ufldv2Detector = {
   backend: "webgpu" | "wasm";
+  precision: "fp16" | "fp32";
   detect(video: HTMLVideoElement): Promise<LaneResult>;
   dispose(): Promise<void>;
 };
@@ -181,34 +181,61 @@ export async function createUfldv2Detector(): Promise<Ufldv2Detector> {
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
   ort.env.wasm.numThreads = 1;
 
-  const modelBytes = await loadModelBytes();
   const hasWebGpu = typeof navigator !== "undefined" && Boolean((navigator as Navigator & { gpu?: unknown }).gpu);
   let backend: "webgpu" | "wasm" = hasWebGpu ? "webgpu" : "wasm";
-  let session: Session;
-  try {
-    session = await ort.InferenceSession.create(modelBytes, {
-      executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"],
-      graphOptimizationLevel: "all"
-    });
-  } catch (error) {
-    if (!hasWebGpu) throw error;
-    backend = "wasm";
-    session = await ort.InferenceSession.create(modelBytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
+  let precision: "fp16" | "fp32" = "fp32";
+  let session: Session | null = null;
+
+  if (hasWebGpu) {
+    try {
+      const fp16Bytes = await loadModelBytes(MODEL_FP16_URL);
+      session = await ort.InferenceSession.create(fp16Bytes, {
+        executionProviders: ["webgpu"],
+        graphOptimizationLevel: "all"
+      });
+      precision = "fp16";
+    } catch (error) {
+      console.warn("FP16 UFLDv2 unavailable; trying FP32 WebGPU", error);
+    }
   }
 
+  if (!session && hasWebGpu) {
+    try {
+      const fp32Bytes = await loadModelBytes(MODEL_FP32_URL);
+      session = await ort.InferenceSession.create(fp32Bytes, {
+        executionProviders: ["webgpu", "wasm"],
+        graphOptimizationLevel: "all"
+      });
+    } catch (error) {
+      console.warn("WebGPU UFLDv2 unavailable; trying WASM", error);
+    }
+  }
+
+  if (!session) {
+    backend = "wasm";
+    precision = "fp32";
+    const fp32Bytes = await loadModelBytes(MODEL_FP32_URL);
+    session = await ort.InferenceSession.create(fp32Bytes, {
+      executionProviders: ["wasm"],
+      graphOptimizationLevel: "all"
+    });
+  }
+
+  const activeSession = session;
   const preprocess = createPreprocessor();
   return {
     backend,
+    precision,
     async detect(video) {
       if (!video.videoWidth || !video.videoHeight || video.readyState < 2) return { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
       const input = preprocess(video);
       const tensor = new ort.Tensor("float32", input, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
-      const result = await session.run({ [session.inputNames[0]]: tensor });
-      const locRow = result.loc_row ?? result[session.outputNames.find((name) => name.includes("loc_row")) ?? ""];
-      const existRow = result.exist_row ?? result[session.outputNames.find((name) => name.includes("exist_row")) ?? ""];
+      const result = await activeSession.run({ [activeSession.inputNames[0]]: tensor });
+      const locRow = result.loc_row ?? result[activeSession.outputNames.find((name) => name.includes("loc_row")) ?? ""];
+      const existRow = result.exist_row ?? result[activeSession.outputNames.find((name) => name.includes("exist_row")) ?? ""];
       if (!locRow || !existRow) throw new Error("Unexpected UFLDv2 output tensors");
       return makeResult(locRow, existRow, video.videoWidth, video.videoHeight);
     },
-    async dispose() { await session.release(); }
+    async dispose() { await activeSession.release(); }
   };
 }
