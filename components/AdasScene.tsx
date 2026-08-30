@@ -28,19 +28,12 @@ function TrafficSignal({ x, z }: { x:number; z:number }) {
 
 function RoadScene({ objects, lane }: Props) {
   const laneShift = THREE.MathUtils.clamp(lane.centerOffset * 2.8, -1.25, 1.25);
-  const curve = THREE.MathUtils.clamp(lane.curve, -1.4, 1.4) * 13;
+  const curve = THREE.MathUtils.clamp(lane.curve, -1, 1) * 7;
   const laneHalfWidth = 1.8;
-  const dashes = useMemo(()=>Array.from({length:20},(_,i)=>4+i*4.5),[]);
-  const pathPieces = useMemo(()=>Array.from({length:23},(_,i)=>2.5+i*3.5),[]);
-  const bend=(z:number)=>{
-    const t=THREE.MathUtils.clamp(z/86,0,1);
-    return curve*(t*t*(3-2*t));
-  };
-  const heading=(z:number)=>{
-    const dz=.5;
-    return Math.atan2(bend(z+dz)-bend(Math.max(0,z-dz)),dz*2);
-  };
-  const roadX=(z:number)=>laneShift+bend(z);
+  const dashes = useMemo(()=>Array.from({length:15},(_,i)=>5+i*5.5),[]);
+  const pathPieces = useMemo(()=>Array.from({length:19},(_,i)=>3+i*3.4),[]);
+  const roadX=(z:number)=>laneShift + curve*Math.pow(z/88,2);
+  const heading=(z:number)=>Math.atan((2*curve*z)/(88*88));
 
   return <>
     <color attach="background" args={["#77819b"]}/><fog attach="fog" args={["#77819b",34,98]}/>
@@ -49,8 +42,8 @@ function RoadScene({ objects, lane }: Props) {
     <mesh rotation={[-Math.PI/2,0,0]} position={[0,-.04,-48]} receiveShadow><planeGeometry args={[100,150]}/><meshStandardMaterial color="#555e72" roughness={.98}/></mesh>
 
     {lane.visible && <>
-      {[-laneHalfWidth, laneHalfWidth].map(boundary=><group key={boundary}>{dashes.map(z=>{const x=roadX(z)+boundary;return <mesh key={`${boundary}-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.018,-z]}><planeGeometry args={[.13,2.9]}/><meshBasicMaterial color="#f6f7fa"/></mesh>})}</group>)}
-      {pathPieces.map(z=>{const x=roadX(z);return <mesh key={`path-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.014,-z]}><planeGeometry args={[3.15,3.72]}/><meshBasicMaterial color="#4c88ff" transparent opacity={.12 + lane.confidence*.13}/></mesh>})}
+      {[-laneHalfWidth, laneHalfWidth].map(boundary=><group key={boundary}>{dashes.map(z=>{const x=roadX(z)+boundary;return <mesh key={`${boundary}-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.018,-z]}><planeGeometry args={[.13,3.25]}/><meshBasicMaterial color="#f6f7fa"/></mesh>})}</group>)}
+      {pathPieces.map(z=>{const x=roadX(z);return <mesh key={`path-${z}`} rotation={[-Math.PI/2,0,-heading(z)]} position={[x,.014,-z]}><planeGeometry args={[3.15,3.65]}/><meshBasicMaterial color="#4c88ff" transparent opacity={.12 + lane.confidence*.13}/></mesh>})}
     </>}
 
     {!lane.visible && <mesh rotation={[-Math.PI/2,0,0]} position={[0,-.005,-42]}><planeGeometry args={[5.8,96]}/><meshStandardMaterial color="#454e61" roughness={.92}/></mesh>}
@@ -61,4 +54,4 @@ function RoadScene({ objects, lane }: Props) {
   </>;
 }
 
-export default function AdasScene(props:Props){return <div className="adas-scene"><Canvas shadows dpr={[1,1.5]} camera={{position:[0,9.3,14.8],fov:51,near:.1,far:150}} onCreated={({camera})=>camera.lookAt(0,.15,-30)}><RoadScene {...props}/></Canvas><div className="scene-badge">3D PERCEPTION</div><div className="scene-horizon">CURVATURE-AWARE ROAD MODEL</div></div>}
+export default function AdasScene(props:Props){return <div className="adas-scene"><Canvas shadows dpr={[1,1.5]} camera={{position:[0,9.3,14.8],fov:51,near:.1,far:150}} onCreated={({camera})=>camera.lookAt(0,.15,-30)}><RoadScene {...props}/></Canvas><div className="scene-badge">3D PERCEPTION</div><div className="scene-horizon">DETECTED LANE ONLY</div></div>}

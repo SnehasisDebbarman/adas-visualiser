@@ -14,7 +14,6 @@
     "@tensorflow/tfjs": "4.22.0",
     "@types/three": "^0.179.0",
     "next": "16.3.3",
-    "onnxruntime-web": "1.29.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "three": "^0.179.0"
@@ -23,7 +22,6 @@
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "tar": "^7.4.3",
     "typescript": "^5.9.0"
   }
 }
