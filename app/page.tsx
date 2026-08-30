@@ -15,6 +15,7 @@ type LaneEngine = "idle" | "loading" | "yolop-webgpu" | "yolop-wasm" | "fallback
 
 const ROAD_CLASSES = new Set(["person", "bicycle", "car", "motorcycle", "bus", "truck", "traffic light", "stop sign"]);
 const VEHICLE_CLASSES = new Set(["bicycle", "car", "motorcycle", "bus", "truck"]);
+function isMobileDevice() { return typeof navigator !== "undefined" && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent); }
 const EMPTY_LANE: LaneResult = { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
 
 function colourForClass(name: string) {
@@ -141,8 +142,14 @@ export default function Home() {
     return objectLoadRef.current;
   }, []);
 
-  const startPerceptionModels = useCallback(async () => {
+  const startPerceptionModels = useCallback(async (source: SourceMode) => {
     await ensureLaneModel();
+    const mobile = isMobileDevice();
+    if (mobile) {
+      setShow3D(false);
+      setStatus(source === "video" ? "YOLOP lanes active — mobile safe mode" : "YOLOP lanes active — mobile mode");
+      return;
+    }
     setShow3D(true);
     window.setTimeout(() => { void ensureObjectModel(); }, 1400);
   }, [ensureLaneModel, ensureObjectModel]);
@@ -244,11 +251,14 @@ export default function Home() {
     if (!ctx) return;
     let frameCount = 0;
     let fpsStartedAt = performance.now();
-    const mobile = typeof navigator !== "undefined" && /iPhone|iPad|Android/i.test(navigator.userAgent);
+    const mobile = isMobileDevice();
 
     const frame = (now: number) => {
       if (!video.videoWidth || !video.videoHeight) { rafRef.current = requestAnimationFrame(frame); return; }
-      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
+      const maxOverlayWidth = mobile ? 960 : 1280;
+      const overlayWidth = Math.min(video.videoWidth, maxOverlayWidth);
+      const overlayHeight = Math.max(1, Math.round(overlayWidth * video.videoHeight / video.videoWidth));
+      if (canvas.width !== overlayWidth || canvas.height !== overlayHeight) { canvas.width = overlayWidth; canvas.height = overlayHeight; }
 
       const neural = neuralLaneRef.current;
       const neuralInterval = mobile ? 720 : neural?.backend === "webgpu" ? 240 : 500;
@@ -271,8 +281,11 @@ export default function Home() {
       }
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.scale(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
       drawLaneOverlay(ctx, laneResultRef.current);
       drawPredictions(ctx, predictionsRef.current);
+      ctx.restore();
 
       frameCount++;
       if (now - fpsStartedAt >= 1000) {
@@ -316,7 +329,7 @@ export default function Home() {
       await video.play();
       setMode("camera");
       setStatus("Camera ready — loading curved-lane perception…");
-      void startPerceptionModels();
+      void startPerceptionModels("camera");
     } catch (error) {
       console.error(error);
       setStatus("Camera permission was denied or unavailable");
@@ -352,7 +365,7 @@ export default function Home() {
       setMode("video");
       await video.play().catch(() => undefined);
       setStatus("Video ready — loading curved-lane perception…");
-      void startPerceptionModels();
+      void startPerceptionModels("video");
     } catch (error) {
       console.error(error);
       setMode("idle");
