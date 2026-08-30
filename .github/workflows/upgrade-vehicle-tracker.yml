@@ -1,0 +1,46 @@
+name: Upgrade vehicle tracker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upgrade-vehicle-tracker.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Upgrade browser tracker
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('app/page.tsx')
+          s=p.read_text()
+          s=s.replace('const TRACK_GRACE_MS = 1600;\nconst TRACK_PREDICT_MS = 650;', 'const TRACK_GRACE_MS = 2200;\nconst TRACK_PREDICT_MS = 900;')
+          old='function boxVisible(bbox:[number,number,number,number],vw:number,vh:number){const[x,y,w,h]=bbox,margin=Math.max(vw,vh)*.035;return x+w>-margin&&y+h>-margin&&x<vw+margin&&y<vh+margin}'
+          new=old+'\nfunction bboxIou(a:[number,number,number,number],b:[number,number,number,number]){const ax2=a[0]+a[2],ay2=a[1]+a[3],bx2=b[0]+b[2],by2=b[1]+b[3],ix=Math.max(0,Math.min(ax2,bx2)-Math.max(a[0],b[0])),iy=Math.max(0,Math.min(ay2,by2)-Math.max(a[1],b[1])),inter=ix*iy,union=a[2]*a[3]+b[2]*b[3]-inter;return union>0?inter/union:0}\nfunction compatibleTrackClass(a:string,b:string){return a===b||(VEHICLE_CLASSES.has(a)&&VEHICLE_CLASSES.has(b))}'
+          if old not in s: raise SystemExit('boxVisible anchor missing')
+          s=s.replace(old,new)
+          old_match='for(const old of previous){if(old.class!==item.class||used.has(old.id))continue;const[ox,oy]=centre(old.bbox),d=Math.hypot(cx-ox,cy-oy)/Math.hypot(vw,vh);if(d<bd&&d<.16){best=old;bd=d}}'
+          new_match='for(const old of previous){if(!compatibleTrackClass(old.class,item.class)||used.has(old.id))continue;const age=Math.min(now-old.lastSeen,TRACK_PREDICT_MS),predicted:[number,number,number,number]=[old.bbox[0]+old.velocity[0]*age,old.bbox[1]+old.velocity[1]*age,Math.max(3,old.bbox[2]+old.velocity[2]*age),Math.max(3,old.bbox[3]+old.velocity[3]*age)],[ox,oy]=centre(predicted),centerDistance=Math.hypot(cx-ox,cy-oy)/Math.hypot(vw,vh),overlap=bboxIou(item.bbox,predicted),cost=centerDistance*.68+(1-overlap)*.32;if((centerDistance<.22||overlap>.08)&&cost<bd){best=old;bd=cost}}'
+          if old_match not in s: raise SystemExit('matching block missing')
+          s=s.replace(old_match,new_match)
+          old_vel='const velocity:[number,number,number,number]=best?[\n    THREEClamp((item.bbox[0]-best.bbox[0])/dt,-.8,.8),\n    THREEClamp((item.bbox[1]-best.bbox[1])/dt,-.8,.8),\n    THREEClamp((item.bbox[2]-best.bbox[2])/dt,-.45,.45),\n    THREEClamp((item.bbox[3]-best.bbox[3])/dt,-.45,.45)\n   ]:[0,0,0,0];'
+          new_vel='const velocity:[number,number,number,number]=best?[\n    best.velocity[0]*.55+THREEClamp((item.bbox[0]-best.bbox[0])/dt,-.8,.8)*.45,\n    best.velocity[1]*.55+THREEClamp((item.bbox[1]-best.bbox[1])/dt,-.8,.8)*.45,\n    best.velocity[2]*.55+THREEClamp((item.bbox[2]-best.bbox[2])/dt,-.45,.45)*.45,\n    best.velocity[3]*.55+THREEClamp((item.bbox[3]-best.bbox[3])/dt,-.45,.45)*.45\n   ]:[0,0,0,0];'
+          if old_vel not in s: raise SystemExit('velocity block missing')
+          s=s.replace(old_vel,new_vel)
+          p.write_text(s)
+          PY
+      - name: Commit upgrade
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/page.tsx
+          git commit -m 'Improve vehicle identity persistence with motion and IoU matching'
+          git push origin HEAD:main
