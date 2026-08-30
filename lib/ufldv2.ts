@@ -10,6 +10,8 @@ const RESIZED_HEIGHT = Math.round(INPUT_HEIGHT / 0.6);
 const NUM_GRID_ROW = 200;
 const NUM_ROW = 72;
 const NUM_LANES = 4;
+const MODEL_URL = "/models/ufldv2-culane-v1.onnx";
+const MODEL_CACHE = "adas-models-v1";
 const ROW_ANCHORS = Array.from({ length: NUM_ROW }, (_, i) => 0.42 + (i * (1 - 0.42)) / (NUM_ROW - 1));
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
@@ -79,8 +81,6 @@ function fitCurve(points: LanePoint[], width: number, height: number): [LanePoin
   const trimmed = sorted.slice(start, end);
   if (trimmed.length < 12) return null;
 
-  // Quadratic fit in normalized image coordinates: x = a*y^2 + b*y + c.
-  // Normalizing keeps the matrix stable and preserves bends that a straight fit loses.
   let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
   let tx0 = 0, tx1 = 0, tx2 = 0;
   for (const point of trimmed) {
@@ -90,20 +90,13 @@ function fitCurve(points: LanePoint[], width: number, height: number): [LanePoin
     s0 += 1; s1 += y; s2 += y2; s3 += y2 * y; s4 += y2 * y2;
     tx0 += x; tx1 += x * y; tx2 += x * y2;
   }
-  const coeff = solve3(
-    [[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]],
-    [tx2, tx1, tx0]
-  );
+  const coeff = solve3([[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]], [tx2, tx1, tx0]);
   if (!coeff) return null;
   const [qa, qb, qc] = coeff;
   const xAt = (yPx: number) => clamp((qa * Math.pow(yPx / height, 2) + qb * (yPx / height) + qc) * width, 0, width);
-
   const farY = clamp(trimmed[0].y, height * 0.42, height * 0.72);
   const nearY = clamp(trimmed[trimmed.length - 1].y, height * 0.80, height * 0.985);
-  return [
-    { x: xAt(farY), y: farY },
-    { x: xAt(nearY), y: nearY }
-  ];
+  return [{ x: xAt(farY), y: farY }, { x: xAt(nearY), y: nearY }];
 }
 
 function decodeLane(locRow: Float32Array, existRow: Float32Array, laneIndex: number, width: number, height: number) {
@@ -114,9 +107,7 @@ function decodeLane(locRow: Float32Array, existRow: Float32Array, laneIndex: num
     valid++;
     const maxGrid = argmaxGrid(locRow, NUM_GRID_ROW, row, laneIndex);
     const gridPosition = localExpectation(locRow, maxGrid, row, laneIndex);
-    const x = (gridPosition / (NUM_GRID_ROW - 1)) * width;
-    const y = ROW_ANCHORS[row] * height;
-    points.push({ x, y });
+    points.push({ x: (gridPosition / (NUM_GRID_ROW - 1)) * width, y: ROW_ANCHORS[row] * height });
   }
   return { points, confidence: clamp(valid / NUM_ROW, 0, 1) };
 }
@@ -128,9 +119,7 @@ function makeResult(locRowTensor: Tensor, existRowTensor: Tensor, width: number,
   const rightDecoded = decodeLane(locRow, existRow, 2, width, height);
   const left = fitCurve(leftDecoded.points, width, height);
   const right = fitCurve(rightDecoded.points, width, height);
-  const confidence = left && right
-    ? (leftDecoded.confidence + rightDecoded.confidence) / 2
-    : Math.max(leftDecoded.confidence, rightDecoded.confidence) * 0.55;
+  const confidence = left && right ? (leftDecoded.confidence + rightDecoded.confidence) / 2 : Math.max(leftDecoded.confidence, rightDecoded.confidence) * 0.55;
 
   let centerOffset = 0;
   let departure: LaneResult["departure"] = "unknown";
@@ -140,7 +129,6 @@ function makeResult(locRowTensor: Tensor, existRowTensor: Tensor, width: number,
     centerOffset = clamp((width / 2 - laneCenter) / laneWidth, -1, 1);
     departure = centerOffset > 0.14 ? "right" : centerOffset < -0.14 ? "left" : "centered";
   }
-
   return { left, right, confidence, centerOffset, departure };
 }
 
@@ -150,7 +138,6 @@ function createPreprocessor() {
   canvas.height = RESIZED_HEIGHT;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Could not create UFLDv2 preprocessing canvas");
-
   return (video: HTMLVideoElement) => {
     ctx.drawImage(video, 0, 0, INPUT_WIDTH, RESIZED_HEIGHT);
     const image = ctx.getImageData(0, RESIZED_HEIGHT - INPUT_HEIGHT, INPUT_WIDTH, INPUT_HEIGHT).data;
@@ -165,6 +152,24 @@ function createPreprocessor() {
   };
 }
 
+async function loadModelBytes() {
+  const request = new Request(MODEL_URL, { cache: "force-cache" });
+  if (typeof caches !== "undefined") {
+    const cache = await caches.open(MODEL_CACHE);
+    const cached = await cache.match(request);
+    if (cached) return new Uint8Array(await cached.arrayBuffer());
+
+    const response = await fetch(request);
+    if (!response.ok) throw new Error(`UFLDv2 model download failed: ${response.status}`);
+    try { await cache.put(request, response.clone()); } catch (error) { console.warn("Could not persist UFLDv2 model cache", error); }
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  const response = await fetch(request);
+  if (!response.ok) throw new Error(`UFLDv2 model download failed: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 export type Ufldv2Detector = {
   backend: "webgpu" | "wasm";
   detect(video: HTMLVideoElement): Promise<LaneResult>;
@@ -176,30 +181,26 @@ export async function createUfldv2Detector(): Promise<Ufldv2Detector> {
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
   ort.env.wasm.numThreads = 1;
 
+  const modelBytes = await loadModelBytes();
   const hasWebGpu = typeof navigator !== "undefined" && Boolean((navigator as Navigator & { gpu?: unknown }).gpu);
   let backend: "webgpu" | "wasm" = hasWebGpu ? "webgpu" : "wasm";
   let session: Session;
   try {
-    session = await ort.InferenceSession.create("/models/ufldv2.onnx", {
+    session = await ort.InferenceSession.create(modelBytes, {
       executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"],
       graphOptimizationLevel: "all"
     });
   } catch (error) {
     if (!hasWebGpu) throw error;
     backend = "wasm";
-    session = await ort.InferenceSession.create("/models/ufldv2.onnx", {
-      executionProviders: ["wasm"],
-      graphOptimizationLevel: "all"
-    });
+    session = await ort.InferenceSession.create(modelBytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
   }
 
   const preprocess = createPreprocessor();
   return {
     backend,
     async detect(video) {
-      if (!video.videoWidth || !video.videoHeight || video.readyState < 2) {
-        return { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
-      }
+      if (!video.videoWidth || !video.videoHeight || video.readyState < 2) return { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
       const input = preprocess(video);
       const tensor = new ort.Tensor("float32", input, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
       const result = await session.run({ [session.inputNames[0]]: tensor });
@@ -208,8 +209,6 @@ export async function createUfldv2Detector(): Promise<Ufldv2Detector> {
       if (!locRow || !existRow) throw new Error("Unexpected UFLDv2 output tensors");
       return makeResult(locRow, existRow, video.videoWidth, video.videoHeight);
     },
-    async dispose() {
-      await session.release();
-    }
+    async dispose() { await session.release(); }
   };
 }
