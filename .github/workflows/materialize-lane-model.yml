@@ -1,0 +1,64 @@
+name: Materialize UFLDv2 models
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/materialize-lane-model.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-model-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download UFLDv2 archive
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/ufldv2 public/models
+          curl -L --retry 4 --retry-delay 3 \
+            'https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/324_Ultra-Fast-Lane-Detection-v2/resources.tar.gz' \
+            -o /tmp/ufldv2/resources.tar.gz
+          tar -xzf /tmp/ufldv2/resources.tar.gz -C /tmp/ufldv2
+          MODEL=$(find /tmp/ufldv2 -type f -name 'ufldv2_culane_res18_320x1600.onnx' | head -n 1)
+          test -n "$MODEL"
+          cp "$MODEL" public/models/ufldv2-culane-v1.onnx
+          ls -lh public/models/ufldv2-culane-v1.onnx
+
+      - name: Create FP16 model
+        continue-on-error: true
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir onnx onnxconverter-common
+          python - <<'PY'
+          import onnx
+          from onnxconverter_common import float16
+          src = 'public/models/ufldv2-culane-v1.onnx'
+          dst = 'public/models/ufldv2-culane-v1-fp16.onnx'
+          model = onnx.load(src)
+          model = float16.convert_float_to_float16(model, keep_io_types=True)
+          onnx.save(model, dst)
+          print('saved', dst)
+          PY
+          ls -lh public/models/ufldv2-culane-v1-fp16.onnx
+
+      - name: Commit generated model assets
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public/models/ufldv2-culane-v1.onnx
+          if [ -f public/models/ufldv2-culane-v1-fp16.onnx ]; then
+            git add public/models/ufldv2-culane-v1-fp16.onnx
+          fi
+          if git diff --cached --quiet; then
+            echo 'Model assets already up to date.'
+            exit 0
+          fi
+          git commit -m 'chore: materialize cached UFLDv2 model assets'
+          git push origin HEAD:main
