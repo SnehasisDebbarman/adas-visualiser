@@ -4,56 +4,14 @@ type OrtModule = typeof import("onnxruntime-web");
 type Session = import("onnxruntime-web").InferenceSession;
 type Tensor = import("onnxruntime-web").Tensor;
 
-const INPUT_WIDTH = 1600;
-const INPUT_HEIGHT = 320;
-const RESIZED_HEIGHT = Math.round(INPUT_HEIGHT / 0.6);
-const NUM_GRID_ROW = 200;
-const NUM_ROW = 72;
-const NUM_LANES = 4;
-const MODEL_FP32_URL = "/models/ufldv2-culane-v1.onnx";
-const MODEL_FP16_URL = "/models/ufldv2-culane-v1-fp16.onnx";
-const MODEL_CACHE = "adas-models-v2";
-const ROW_ANCHORS = Array.from({ length: NUM_ROW }, (_, i) => 0.42 + (i * (1 - 0.42)) / (NUM_ROW - 1));
+const INPUT = 640;
+const MODEL_URL = "https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/yolop-640-640.onnx";
+const MODEL_CACHE = "adas-models-yolop-v1";
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
-}
-
-function index4(a: number, b: number, c: number, d: number, B: number, C: number, D: number) {
-  return ((a * B + b) * C + c) * D + d;
-}
-
-function argmaxGrid(data: Float32Array, grid: number, row: number, lane: number) {
-  let best = 0;
-  let bestValue = -Infinity;
-  for (let g = 0; g < grid; g++) {
-    const value = data[index4(0, g, row, lane, grid, NUM_ROW, NUM_LANES)];
-    if (value > bestValue) { bestValue = value; best = g; }
-  }
-  return best;
-}
-
-function existsAt(data: Float32Array, row: number, lane: number) {
-  const no = data[index4(0, 0, row, lane, 2, NUM_ROW, NUM_LANES)];
-  const yes = data[index4(0, 1, row, lane, 2, NUM_ROW, NUM_LANES)];
-  return yes > no;
-}
-
-function localExpectation(data: Float32Array, maxIndex: number, row: number, lane: number) {
-  const from = Math.max(0, maxIndex - 1);
-  const to = Math.min(NUM_GRID_ROW - 1, maxIndex + 1);
-  let maxLogit = -Infinity;
-  for (let g = from; g <= to; g++) maxLogit = Math.max(maxLogit, data[index4(0, g, row, lane, NUM_GRID_ROW, NUM_ROW, NUM_LANES)]);
-  let sum = 0;
-  let weighted = 0;
-  for (let g = from; g <= to; g++) {
-    const probability = Math.exp(data[index4(0, g, row, lane, NUM_GRID_ROW, NUM_ROW, NUM_LANES)] - maxLogit);
-    sum += probability;
-    weighted += probability * g;
-  }
-  return sum > 0 ? weighted / sum + 0.5 : maxIndex + 0.5;
 }
 
 function solve3(m: number[][], v: number[]) {
@@ -75,14 +33,11 @@ function solve3(m: number[][], v: number[]) {
 }
 
 function fitCurve(points: LanePoint[], width: number, height: number): [LanePoint, LanePoint] | null {
-  if (points.length < 14) return null;
+  if (points.length < 7) return null;
   const sorted = [...points].sort((a, b) => a.y - b.y);
-  const trimmed = sorted.slice(Math.floor(sorted.length * 0.06), Math.ceil(sorted.length * 0.96));
-  if (trimmed.length < 12) return null;
-
   let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
   let tx0 = 0, tx1 = 0, tx2 = 0;
-  for (const point of trimmed) {
+  for (const point of sorted) {
     const y = point.y / height;
     const x = point.x / width;
     const y2 = y * y;
@@ -91,34 +46,101 @@ function fitCurve(points: LanePoint[], width: number, height: number): [LanePoin
   }
   const coeff = solve3([[s4, s3, s2], [s3, s2, s1], [s2, s1, s0]], [tx2, tx1, tx0]);
   if (!coeff) return null;
-  const [qa, qb, qc] = coeff;
-  const xAt = (yPx: number) => clamp((qa * Math.pow(yPx / height, 2) + qb * (yPx / height) + qc) * width, 0, width);
-  const farY = clamp(trimmed[0].y, height * 0.42, height * 0.72);
-  const nearY = clamp(trimmed[trimmed.length - 1].y, height * 0.80, height * 0.985);
+  const [a, b, c] = coeff;
+  const xAt = (yPx: number) => clamp((a * Math.pow(yPx / height, 2) + b * (yPx / height) + c) * width, 0, width);
+  const farY = clamp(sorted[0].y, height * 0.40, height * 0.70);
+  const nearY = clamp(sorted[sorted.length - 1].y, height * 0.78, height * 0.985);
   return [{ x: xAt(farY), y: farY }, { x: xAt(nearY), y: nearY }];
 }
 
-function decodeLane(locRow: Float32Array, existRow: Float32Array, laneIndex: number, width: number, height: number) {
-  const points: LanePoint[] = [];
-  let valid = 0;
-  for (let row = 0; row < NUM_ROW; row++) {
-    if (!existsAt(existRow, row, laneIndex)) continue;
-    valid++;
-    const maxGrid = argmaxGrid(locRow, NUM_GRID_ROW, row, laneIndex);
-    const gridPosition = localExpectation(locRow, maxGrid, row, laneIndex);
-    points.push({ x: (gridPosition / (NUM_GRID_ROW - 1)) * width, y: ROW_ANCHORS[row] * height });
-  }
-  return { points, confidence: clamp(valid / NUM_ROW, 0, 1) };
+type Preprocessed = {
+  input: Float32Array;
+  scale: number;
+  dx: number;
+  dy: number;
+  contentWidth: number;
+  contentHeight: number;
+};
+
+function createPreprocessor() {
+  const canvas = document.createElement("canvas");
+  canvas.width = INPUT;
+  canvas.height = INPUT;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Could not create YOLOP preprocessing canvas");
+
+  return (video: HTMLVideoElement): Preprocessed => {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const scale = Math.min(INPUT / vw, INPUT / vh);
+    const contentWidth = Math.round(vw * scale);
+    const contentHeight = Math.round(vh * scale);
+    const dx = Math.floor((INPUT - contentWidth) / 2);
+    const dy = Math.floor((INPUT - contentHeight) / 2);
+
+    ctx.fillStyle = "rgb(114,114,114)";
+    ctx.fillRect(0, 0, INPUT, INPUT);
+    ctx.drawImage(video, dx, dy, contentWidth, contentHeight);
+
+    const image = ctx.getImageData(0, 0, INPUT, INPUT).data;
+    const plane = INPUT * INPUT;
+    const input = new Float32Array(plane * 3);
+    for (let i = 0, p = 0; i < image.length; i += 4, p++) {
+      input[p] = (image[i] / 255 - MEAN[0]) / STD[0];
+      input[plane + p] = (image[i + 1] / 255 - MEAN[1]) / STD[1];
+      input[plane * 2 + p] = (image[i + 2] / 255 - MEAN[2]) / STD[2];
+    }
+    return { input, scale, dx, dy, contentWidth, contentHeight };
+  };
 }
 
-function makeResult(locRowTensor: Tensor, existRowTensor: Tensor, width: number, height: number): LaneResult {
-  const locRow = locRowTensor.data as Float32Array;
-  const existRow = existRowTensor.data as Float32Array;
-  const leftDecoded = decodeLane(locRow, existRow, 1, width, height);
-  const rightDecoded = decodeLane(locRow, existRow, 2, width, height);
-  const left = fitCurve(leftDecoded.points, width, height);
-  const right = fitCurve(rightDecoded.points, width, height);
-  const confidence = left && right ? (leftDecoded.confidence + rightDecoded.confidence) / 2 : Math.max(leftDecoded.confidence, rightDecoded.confidence) * 0.55;
+function clusterCenters(mask: Float32Array, y: number) {
+  const centers: number[] = [];
+  let start = -1;
+  for (let x = 0; x < INPUT; x++) {
+    const idx = y * INPUT + x;
+    const foreground = mask[INPUT * INPUT + idx] > mask[idx];
+    if (foreground && start < 0) start = x;
+    if ((!foreground || x === INPUT - 1) && start >= 0) {
+      const end = foreground && x === INPUT - 1 ? x : x - 1;
+      if (end - start >= 1) centers.push((start + end) / 2);
+      start = -1;
+    }
+  }
+  return centers;
+}
+
+function decodeLaneMask(tensor: Tensor, prep: Preprocessed, width: number, height: number): LaneResult {
+  const data = tensor.data as Float32Array;
+  const leftPoints: LanePoint[] = [];
+  const rightPoints: LanePoint[] = [];
+  const centreX = prep.dx + prep.contentWidth / 2;
+  const yStart = prep.dy + Math.round(prep.contentHeight * 0.42);
+  const yEnd = prep.dy + Math.round(prep.contentHeight * 0.98);
+  const samples = 24;
+
+  for (let i = 0; i < samples; i++) {
+    const y = Math.round(yStart + ((yEnd - yStart) * i) / (samples - 1));
+    const centers = clusterCenters(data, clamp(y, 0, INPUT - 1));
+    if (!centers.length) continue;
+
+    let left: number | null = null;
+    let right: number | null = null;
+    for (const x of centers) {
+      if (x < centreX && x >= prep.dx && (left === null || x > left)) left = x;
+      if (x > centreX && x <= prep.dx + prep.contentWidth && (right === null || x < right)) right = x;
+    }
+
+    const sourceY = ((y - prep.dy) / prep.contentHeight) * height;
+    if (left !== null) leftPoints.push({ x: ((left - prep.dx) / prep.contentWidth) * width, y: sourceY });
+    if (right !== null) rightPoints.push({ x: ((right - prep.dx) / prep.contentWidth) * width, y: sourceY });
+  }
+
+  const left = fitCurve(leftPoints, width, height);
+  const right = fitCurve(rightPoints, width, height);
+  const leftConfidence = clamp(leftPoints.length / samples, 0, 1);
+  const rightConfidence = clamp(rightPoints.length / samples, 0, 1);
+  const confidence = left && right ? (leftConfidence + rightConfidence) / 2 : Math.max(leftConfidence, rightConfidence) * 0.55;
 
   let centerOffset = 0;
   let departure: LaneResult["departure"] = "unknown";
@@ -128,50 +150,29 @@ function makeResult(locRowTensor: Tensor, existRowTensor: Tensor, width: number,
     centerOffset = clamp((width / 2 - laneCenter) / laneWidth, -1, 1);
     departure = centerOffset > 0.14 ? "right" : centerOffset < -0.14 ? "left" : "centered";
   }
+
   return { left, right, confidence, centerOffset, departure };
 }
 
-function createPreprocessor() {
-  const canvas = document.createElement("canvas");
-  canvas.width = INPUT_WIDTH;
-  canvas.height = RESIZED_HEIGHT;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) throw new Error("Could not create UFLDv2 preprocessing canvas");
-  return (video: HTMLVideoElement) => {
-    ctx.drawImage(video, 0, 0, INPUT_WIDTH, RESIZED_HEIGHT);
-    const image = ctx.getImageData(0, RESIZED_HEIGHT - INPUT_HEIGHT, INPUT_WIDTH, INPUT_HEIGHT).data;
-    const plane = INPUT_WIDTH * INPUT_HEIGHT;
-    const input = new Float32Array(plane * 3);
-    for (let i = 0, p = 0; i < image.length; i += 4, p++) {
-      input[p] = (image[i] / 255 - MEAN[0]) / STD[0];
-      input[plane + p] = (image[i + 1] / 255 - MEAN[1]) / STD[1];
-      input[plane * 2 + p] = (image[i + 2] / 255 - MEAN[2]) / STD[2];
-    }
-    return input;
-  };
-}
-
-async function loadModelBytes(url: string) {
-  const request = new Request(url, { cache: "force-cache" });
+async function loadModelBytes() {
+  const request = new Request(MODEL_URL, { cache: "force-cache", mode: "cors" });
   if (typeof caches !== "undefined") {
     const cache = await caches.open(MODEL_CACHE);
     const cached = await cache.match(request);
     if (cached) return new Uint8Array(await cached.arrayBuffer());
-
     const response = await fetch(request);
-    if (!response.ok) throw new Error(`UFLDv2 model download failed (${url}): ${response.status}`);
-    try { await cache.put(request, response.clone()); } catch (error) { console.warn("Could not persist UFLDv2 model cache", error); }
+    if (!response.ok) throw new Error(`YOLOP model download failed: ${response.status}`);
+    try { await cache.put(request, response.clone()); } catch (error) { console.warn("Could not persist YOLOP model cache", error); }
     return new Uint8Array(await response.arrayBuffer());
   }
-
   const response = await fetch(request);
-  if (!response.ok) throw new Error(`UFLDv2 model download failed (${url}): ${response.status}`);
+  if (!response.ok) throw new Error(`YOLOP model download failed: ${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
 }
 
 export type Ufldv2Detector = {
   backend: "webgpu" | "wasm";
-  precision: "fp16" | "fp32";
+  precision: "fp32";
   detect(video: HTMLVideoElement): Promise<LaneResult>;
   dispose(): Promise<void>;
 };
@@ -181,61 +182,40 @@ export async function createUfldv2Detector(): Promise<Ufldv2Detector> {
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
   ort.env.wasm.numThreads = 1;
 
+  const modelBytes = await loadModelBytes();
   const hasWebGpu = typeof navigator !== "undefined" && Boolean((navigator as Navigator & { gpu?: unknown }).gpu);
   let backend: "webgpu" | "wasm" = hasWebGpu ? "webgpu" : "wasm";
-  let precision: "fp16" | "fp32" = "fp32";
-  let session: Session | null = null;
+  let session: Session;
 
-  if (hasWebGpu) {
-    try {
-      const fp16Bytes = await loadModelBytes(MODEL_FP16_URL);
-      session = await ort.InferenceSession.create(fp16Bytes, {
-        executionProviders: ["webgpu"],
-        graphOptimizationLevel: "all"
-      });
-      precision = "fp16";
-    } catch (error) {
-      console.warn("FP16 UFLDv2 unavailable; trying FP32 WebGPU", error);
-    }
-  }
-
-  if (!session && hasWebGpu) {
-    try {
-      const fp32Bytes = await loadModelBytes(MODEL_FP32_URL);
-      session = await ort.InferenceSession.create(fp32Bytes, {
-        executionProviders: ["webgpu", "wasm"],
-        graphOptimizationLevel: "all"
-      });
-    } catch (error) {
-      console.warn("WebGPU UFLDv2 unavailable; trying WASM", error);
-    }
-  }
-
-  if (!session) {
-    backend = "wasm";
-    precision = "fp32";
-    const fp32Bytes = await loadModelBytes(MODEL_FP32_URL);
-    session = await ort.InferenceSession.create(fp32Bytes, {
-      executionProviders: ["wasm"],
+  try {
+    session = await ort.InferenceSession.create(modelBytes, {
+      executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"],
       graphOptimizationLevel: "all"
     });
+  } catch (error) {
+    if (!hasWebGpu) throw error;
+    console.warn("YOLOP WebGPU init failed; using WASM", error);
+    backend = "wasm";
+    session = await ort.InferenceSession.create(modelBytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
   }
 
-  const activeSession = session;
   const preprocess = createPreprocessor();
+  const laneOutputName = session.outputNames.find((name) => name.includes("lane_line")) ?? "lane_line_seg";
+
   return {
     backend,
-    precision,
+    precision: "fp32",
     async detect(video) {
-      if (!video.videoWidth || !video.videoHeight || video.readyState < 2) return { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
-      const input = preprocess(video);
-      const tensor = new ort.Tensor("float32", input, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
-      const result = await activeSession.run({ [activeSession.inputNames[0]]: tensor });
-      const locRow = result.loc_row ?? result[activeSession.outputNames.find((name) => name.includes("loc_row")) ?? ""];
-      const existRow = result.exist_row ?? result[activeSession.outputNames.find((name) => name.includes("exist_row")) ?? ""];
-      if (!locRow || !existRow) throw new Error("Unexpected UFLDv2 output tensors");
-      return makeResult(locRow, existRow, video.videoWidth, video.videoHeight);
+      if (!video.videoWidth || !video.videoHeight || video.readyState < 2) {
+        return { left: null, right: null, confidence: 0, centerOffset: 0, departure: "unknown" };
+      }
+      const prep = preprocess(video);
+      const input = new ort.Tensor("float32", prep.input, [1, 3, INPUT, INPUT]);
+      const outputs = await session.run({ [session.inputNames[0]]: input });
+      const laneTensor = outputs[laneOutputName];
+      if (!laneTensor) throw new Error("YOLOP lane segmentation output missing");
+      return decodeLaneMask(laneTensor, prep, video.videoWidth, video.videoHeight);
     },
-    async dispose() { await activeSession.release(); }
+    async dispose() { await session.release(); }
   };
 }
